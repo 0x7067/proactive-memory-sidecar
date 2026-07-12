@@ -33,3 +33,32 @@ export class FakeModelAdapter implements ModelAdapter {
     return Promise.resolve(next);
   }
 }
+
+/**
+ * A `ModelAdapter` whose `.complete()` calls resolve only when the test
+ * explicitly settles them, in whatever order the test chooses — used to
+ * deterministically reproduce two concurrent hook invocations whose model
+ * calls *complete* out of order relative to the order they *started* in,
+ * without relying on real timers/sleeps (see the "concurrency" suite in
+ * test/engine/engine.test.ts).
+ */
+export class DeferredModelAdapter implements ModelAdapter {
+  public readonly calls: ModelRequest[] = [];
+  private readonly pending: Array<(r: ModelResponse | Error) => void> = [];
+
+  complete(request: ModelRequest): Promise<ModelResponse> {
+    this.calls.push(request);
+    return new Promise((resolve, reject) => {
+      this.pending.push((r) => (r instanceof Error ? reject(r) : resolve(r)));
+    });
+  }
+
+  /** Settles the Nth (0-indexed, in call-arrival order) still-pending call. */
+  settle(index: number, response: FakeResponse): void {
+    const resolver = this.pending[index];
+    if (!resolver) {
+      throw new Error(`DeferredModelAdapter: no pending call at index ${index}`);
+    }
+    resolver(normalize(response));
+  }
+}

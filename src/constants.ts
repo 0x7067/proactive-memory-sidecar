@@ -67,7 +67,7 @@ export const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 900;
 export const DEFAULT_DB_RELATIVE_PATH = ".claude/pms/bank.sqlite3";
 
 /** Current SQLite schema version, tracked via `PRAGMA user_version`. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** The three hook events this sidecar attaches to. Anything else is a silent no-op. */
 export const HANDLED_HOOK_EVENTS = [
