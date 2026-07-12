@@ -27,6 +27,16 @@ export const DEFAULT_TRANSCRIPT_TAIL_K = 8;
 /** Mechanically enforced reminder length ceiling, in conservatively-estimated tokens. */
 export const DEFAULT_REMINDER_MAX_TOKENS = 100;
 
+/**
+ * Absolute, non-overridable ceiling on the reminder token cap — the
+ * product invariant is "a maximum 100-token reminder"; configuration may
+ * only ever lower this, never raise it. Enforced twice, mirroring the
+ * model-timeout pattern: once when config is loaded (`src/config.ts`) and
+ * again inside the guard itself (`checkTokenCap` in `src/engine/guards.ts`)
+ * so a misconfigured/future caller can never bypass it.
+ */
+export const HARD_REMINDER_MAX_TOKENS = 100;
+
 /** How many previously-logged reminders (any shadow state) to compare a new candidate against. */
 export const DEFAULT_SIMILARITY_HISTORY_WINDOW = 10;
 
@@ -42,8 +52,20 @@ export const HARD_MODEL_TIMEOUT_MS = 15_000;
 /** Default (overridable, but clamped to HARD_MODEL_TIMEOUT_MS) model call timeout. */
 export const DEFAULT_MODEL_TIMEOUT_MS = 15_000;
 
-/** Outer safety-net wall-clock ceiling for one whole hook invocation (model call + DB work). */
-export const DEFAULT_OVERALL_TIMEOUT_MS = 18_000;
+/**
+ * Absolute, non-overridable ceiling on the ENTIRE hook invocation — stdin
+ * read, SQLite open/contention, and the model call together — per the
+ * documented "15 second sidecar budget". Mirrors HARD_MODEL_TIMEOUT_MS's
+ * dual-enforcement pattern: clamped once when config is loaded
+ * (`src/config.ts`) and again, dynamically, against the single
+ * per-invocation `Deadline` (`src/lib/deadline.ts`) that `src/bin/hook.ts`
+ * threads through stdin/DB-open/the model call, so no phase can
+ * independently claim a larger slice of time than this ceiling allows.
+ */
+export const HARD_OVERALL_TIMEOUT_MS = 15_000;
+
+/** Outer safety-net wall-clock ceiling for one whole hook invocation (stdin + DB work + model call). */
+export const DEFAULT_OVERALL_TIMEOUT_MS = HARD_OVERALL_TIMEOUT_MS;
 
 /** How long we will wait to read the hook JSON payload from stdin before giving up. */
 export const DEFAULT_STDIN_TIMEOUT_MS = 5_000;
@@ -67,7 +89,7 @@ export const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 900;
 export const DEFAULT_DB_RELATIVE_PATH = ".claude/pms/bank.sqlite3";
 
 /** Current SQLite schema version, tracked via `PRAGMA user_version`. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** The three hook events this sidecar attaches to. Anything else is a silent no-op. */
 export const HANDLED_HOOK_EVENTS = [

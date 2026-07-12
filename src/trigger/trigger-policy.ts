@@ -2,8 +2,16 @@ import type { HandledHookEventName, TriggerDecision } from "../types.js";
 
 export interface TriggerPolicyInput {
   hookEvent: HandledHookEventName;
-  /** The step count *after* incrementing for this event. */
-  newStep: number;
+  /**
+   * The durable count of successful `PostToolUse` events for this session,
+   * after incrementing for this event — i.e. NOT the all-event
+   * chronological step (`session.step_count`), which also advances for
+   * `PostToolUseFailure` and `PreCompact` and would shift *which*
+   * `PostToolUse` call lands on the cadence-Nth tick (see README "Trigger
+   * policy" and `src/store/session-progress-store.ts`). Only meaningful,
+   * and only read, when `hookEvent === "PostToolUse"`.
+   */
+  postToolUseSuccessCount: number;
   cadenceN: number;
   /** Precomputed by the caller via `isNearDuplicateToolCall` — only meaningful for PostToolUse. */
   isNearDuplicate: boolean;
@@ -40,7 +48,7 @@ export function decideTrigger(input: TriggerPolicyInput): TriggerDecision {
     return { triggered: true, forced: true, reason: "forced_near_duplicate", phase2Eligible: true };
   }
 
-  if (input.cadenceN > 0 && input.newStep % input.cadenceN === 0) {
+  if (input.cadenceN > 0 && input.postToolUseSuccessCount % input.cadenceN === 0) {
     return { triggered: true, forced: false, reason: "cadence", phase2Eligible: true };
   }
 

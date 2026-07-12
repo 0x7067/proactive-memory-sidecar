@@ -110,6 +110,8 @@ export type Phase2Outcome =
   | "no_intervention"
   | "accepted"
   | "parse_error"
+  /** A stale, out-of-order response for a step a newer step has already superseded — see src/store/session-progress-store.ts. */
+  | "stale_superseded"
   | `rejected:${string}`;
 
 export interface TriggerEventRow {

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
+import { openDatabase } from "../../src/db/connection.js";
 
 const HOOK_BIN = fileURLToPath(new URL("../../src/bin/hook.js", import.meta.url));
 
@@ -276,5 +277,81 @@ Reminder: the task requires X, as established earlier.
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /subagent/i);
+  });
+
+  describe("time budget: a single deadline bounds stdin, DB contention, and the model call", () => {
+    test("stdin read is bounded by the overall deadline, not the (larger) configured stdin timeout", async () => {
+      const start = Date.now();
+      const result = await new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolve, reject) => {
+        const child = spawn(process.execPath, [HOOK_BIN], {
+          cwd: projectDir,
+          env: {
+            ...process.env,
+            ...baseEnv({ PMS_STDIN_TIMEOUT_MS: "5000", PMS_OVERALL_TIMEOUT_MS: "300", PMS_MODEL_TIMEOUT_MS: "300" }),
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        const killer = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("hook process did not exit within the test's own 6s safety timeout"));
+        }, 6000);
+        child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+        child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+        child.on("error", (err) => {
+          clearTimeout(killer);
+          reject(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(killer);
+          resolve({ stdout, stderr, exitCode: code });
+        });
+        // Deliberately never write to or end stdin: simulates a slow/absent
+        // hook payload writer. The 5000ms PMS_STDIN_TIMEOUT_MS is much
+        // larger than the 300ms overall deadline — the fix requires the
+        // smaller, single overall budget to win.
+      });
+      const elapsed = Date.now() - start;
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.stdout, "");
+      assert.ok(
+        elapsed < 2500,
+        `expected stdin read to be bounded by the ~300ms overall deadline, not the 5000ms stdin timeout; took ${elapsed}ms`,
+      );
+    });
+
+    test("SQLite write-lock contention fails open quickly, bounded by the deadline rather than the full configured busy_timeout", async () => {
+      // Pre-create + fully initialize the schema so the child's own
+      // openDatabase() -> initializeSchema() is a fast no-op read (WAL
+      // readers never block on a pending writer) — contention is then
+      // forced to manifest where it matters: the child's Phase A `BEGIN
+      // IMMEDIATE` in src/engine/engine.ts.
+      const seedDb = openDatabase(dbPath(), { busyTimeoutMs: 2000 });
+      seedDb.exec("BEGIN IMMEDIATE");
+      try {
+        const start = Date.now();
+        const result = await runHook(
+          postToolUsePayload(),
+          baseEnv({
+            PMS_MODE: "live",
+            PMS_BUSY_TIMEOUT_MS: "5000",
+            PMS_OVERALL_TIMEOUT_MS: "600",
+            PMS_MODEL_TIMEOUT_MS: "600",
+          }),
+          projectDir,
+        );
+        const elapsed = Date.now() - start;
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.stdout, "");
+        assert.ok(
+          elapsed < 3000,
+          `expected contention fail-open bounded by the ~600ms deadline, not the full 5000ms busy_timeout; took ${elapsed}ms`,
+        );
+      } finally {
+        seedDb.exec("ROLLBACK");
+        seedDb.close();
+      }
+    });
   });
 });

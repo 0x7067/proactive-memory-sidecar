@@ -128,6 +128,14 @@ describe("db schema + WAL", () => {
     const names = tables.map((t) => t.name);
     assert.ok(names.includes("trigger_event"));
     assert.ok(names.includes("bank_op_log"));
+    assert.ok(names.includes("session_progress"));
+  });
+
+  test("session_progress has the expected columns and per-session defaults", () => {
+    const cols = (tmp.db.prepare("PRAGMA table_info(session_progress)").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    assert.deepEqual(cols, ["session_id", "committed_step", "post_tool_use_success_count"]);
   });
 
   test("openDatabase creates missing parent directories", () => {

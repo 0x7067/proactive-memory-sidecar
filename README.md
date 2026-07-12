@@ -31,7 +31,9 @@ deliberately diverges.
 - [Wire formats](#wire-formats)
 - [Trigger policy](#trigger-policy)
 - [Mechanical guards](#mechanical-guards-the-reminder-contract)
+- [Model-prompt data boundaries](#model-prompt-data-boundaries)
 - [Fail-open design](#fail-open-design)
+  - [Time budget](#time-budget)
 - [Concurrency model](#concurrency-model)
 - [Kill switch](#kill-switch)
 - [Limitations](#limitations)
@@ -55,9 +57,11 @@ Per invocation, in order:
    entirely — no bookkeeping, no logging.
 3. **Trigger policy.** Decide whether this event is *forced* (tool
    failure, or a near-identical repeat of a recent tool call), a *cadence*
-   hit (every `PMS_CADENCE_N`th `PostToolUse`-family call, default 4), a
-   *PreCompact sweep* (always runs, Phase 1 only), or none of the above
-   (the common "fast path" — no model call at all).
+   hit (every `PMS_CADENCE_N`th **successful `PostToolUse`** call, default
+   4 — `PostToolUseFailure` and `PreCompact` never count towards this and
+   never shift which call lands on the Nth tick), a *PreCompact sweep*
+   (always runs, Phase 1 only), or none of the above (the common "fast
+   path" — no model call at all).
 4. **Phase 1 — bank maintenance** (only on a trigger). One model call
    returns an ordered list of bank operations
    (`update_status` / `save_knowledge` / `save_procedural` / `delete`),
@@ -125,7 +129,18 @@ configured every triggered step fails open (harmless, but inert).
 | `PMS_MODEL_BASE_URL` | provider default | Override for a proxy, Azure, or a local server |
 | `PMS_MODEL_NAME` | `claude-haiku-4-5` (anthropic) / `gpt-4.1-mini` (openai) | See below |
 | `PMS_MODEL_MAX_OUTPUT_TOKENS` | `900` | Output budget for one Phase 1 + Phase 2 response |
-| `PMS_MODEL_TIMEOUT_MS` | `15000` | Clamped to `[1000, 15000]` — **15000 is a hard, non-overridable ceiling** enforced both in config loading and again inside the HTTP adapter's `AbortController` |
+| `PMS_MODEL_TIMEOUT_MS` | `15000` | Clamped to `[1000, 15000]` — **15000 is a hard, non-overridable ceiling** enforced in config loading, again inside the HTTP adapter's `AbortController`, and a third time dynamically against whatever remains of the single overall deadline below (so it is effectively often *less* than 15000 in practice) |
+
+**Time budget.** The sidecar's contract is a **15-second-or-less whole
+invocation**, not just a 15-second model call — see ["Time
+budget"](#time-budget) for exactly how one deadline is threaded through
+stdin, SQLite, and the model call, and its one honestly-documented limit.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PMS_OVERALL_TIMEOUT_MS` | `15000` | Clamped to `[PMS_MODEL_TIMEOUT_MS, 15000]` — **15000 is a hard, non-overridable ceiling** on the entire hook invocation (stdin + DB + model), enforced once in config loading and again dynamically via `src/lib/deadline.ts` |
+| `PMS_STDIN_TIMEOUT_MS` | `5000` | Clamped to `[100, 60000]`, but further capped at runtime to whatever remains of `PMS_OVERALL_TIMEOUT_MS` |
+| `PMS_BUSY_TIMEOUT_MS` | `5000` | Clamped to `[0, 60000]`, but the `busy_timeout` PRAGMA actually applied to each connection is further capped at runtime to whatever remains of `PMS_OVERALL_TIMEOUT_MS` — see ["Concurrency model"](#concurrency-model) |
 
 **On the default model.** The reference paper uses an Opus-tier model as
 the memory agent against Sonnet/Opus-tier action agents, and its own
@@ -267,10 +282,13 @@ GROUP BY session_id
 ORDER BY live_entries DESC;
 ```
 
-`trigger_event` and `bank_op_log` are additive tables beyond the three the
-design brief mandates verbatim (`session`, `entry`, `intervention_log`) —
-see [`src/db/schema.ts`](src/db/schema.ts) for the full DDL and the
-rationale in its header comment.
+`trigger_event`, `bank_op_log`, and `session_progress` are additive tables
+beyond the three the design brief mandates verbatim (`session`, `entry`,
+`intervention_log`) — see [`src/db/schema.ts`](src/db/schema.ts) for the
+full DDL and the rationale in its header comment. `session_progress`
+(schema v2) holds the durable cadence counter and concurrency watermark —
+see ["Trigger policy"](#trigger-policy) and ["Concurrency
+model"](#concurrency-model).
 
 ## Wire formats
 
@@ -311,6 +329,14 @@ model response immediately before the Phase 2 tag:
 (`{op, id}` — soft delete). Anything else is dropped (and logged in
 `bank_op_log`), never applied.
 
+**`id` is a bounded-length slug, not free text**: lowercase ASCII
+letters, digits, `:`, `_`, and `-` only (`^[a-z0-9:_-]+$`), never blank,
+at most `PMS_ENTRY_ID_MAX_CHARS` (default 128) characters, enforced
+identically for `save_knowledge`/`save_procedural`/`delete`. An id
+outside that grammar is dropped (logged in `bank_op_log` with a reason),
+never sanitized or truncated into something valid — see ["Model-prompt
+data boundaries"](#model-prompt-data-boundaries) for why.
+
 **Live-mode stdout** is exactly the shape Claude Code's hook JSON output
 schema expects for `additionalContext` (see the ["Add context for
 Claude"](https://code.claude.com/docs/en/hooks) section of the Claude
@@ -330,11 +356,23 @@ Implemented in [`src/trigger/trigger-policy.ts`](src/trigger/trigger-policy.ts)
 
 | Condition | Hook event | Forced? | Phase 2 eligible? |
 |---|---|---|---|
-| Cadence: `step_count % PMS_CADENCE_N == 0` | `PostToolUse` | no | yes |
+| Cadence: `successful_post_tool_use_count % PMS_CADENCE_N == 0` | `PostToolUse` | no | yes |
 | Tool failure | `PostToolUseFailure` | **yes** | yes |
 | Near-identical repeated call (see below) | `PostToolUse` | **yes** | yes |
 | Compaction about to happen | `PreCompact` | yes | **no — mechanically forced to silence regardless of model output** |
 | None of the above | `PostToolUse` | — | *(not triggered — fast path, zero model calls)* |
+
+**Cadence counts only successful `PostToolUse` events.** The counter
+behind `successful_post_tool_use_count` above
+(`session_progress.post_tool_use_success_count`, a durable per-session
+counter distinct from `session.step_count`) increments *only* for
+`PostToolUse`; `PostToolUseFailure` and `PreCompact` never advance it. A
+session that sees `PostToolUse, PostToolUse, PostToolUse, PreCompact,
+PostToolUse` still fires cadence exactly on that 4th `PostToolUse` call at
+`PMS_CADENCE_N=4`, not the 5th all-event step. `session.step_count` (the
+mandated schema's own column) is unaffected by this and remains the
+all-event chronological step used for every other ordering/audit purpose
+(`entry`, `trigger_event`, `intervention_log` primary keys).
 
 **Near-identical repeated calls** are detected against this project's own
 `trigger_event` log (not the transcript file, which Claude Code documents
@@ -360,11 +398,19 @@ logged as `rejected:<guard>` in `trigger_event.phase2_outcome`):
    right after this step's own Phase 1 edits were applied* (the
    "prospective bank"). A reminder may cite an entry it just created in
    the same response.
-2. **Token cap** (`checkTokenCap`) — ≤100 tokens (configurable,
-   `PMS_REMINDER_MAX_TOKENS`) by a documented conservative estimator (no
-   tokenizer package is a dependency of this project): `max(whitespace
-   word count, ceil(chars / 4))`. Taking the larger of the two errs toward
-   *rejecting* borderline-long text rather than under-counting.
+2. **Token cap** (`checkTokenCap`) — ≤100 tokens by a documented
+   conservative estimator (no tokenizer package is a dependency of this
+   project): `max(whitespace word count, ceil(chars / 4))`. Taking the
+   larger of the two errs toward *rejecting* borderline-long text rather
+   than under-counting — but it is still a heuristic, not a real
+   model-specific tokenizer, and can under-count dense non-whitespace-
+   delimited scripts (e.g. CJK text) or unusually long single tokens
+   (URLs, hashes); the conservative bias narrows, but does not eliminate,
+   that gap. `PMS_REMINDER_MAX_TOKENS` may *lower* this cap (down to 1);
+   **100 is a hard, non-overridable ceiling** — configuration cannot raise
+   it, enforced both when config is loaded (`src/config.ts`) and again
+   inside the guard itself (`HARD_REMINDER_MAX_TOKENS`), so the cap holds
+   even if some future caller ever constructs a looser `GuardContext`.
 3. **No wall-clock time** (`checkNoWallClockTime`) — regex-based rejection
    of ISO dates/datetimes, slash dates, clock times, month-day-year
    phrasing, and phrases like "right now"/"just now". Step-relative
@@ -392,6 +438,48 @@ None of these guards make a model call — they are plain, deterministic
 code, independently unit-tested (`test/engine/guards.test.ts`) against
 both the paper's own example text and deliberately-adversarial inputs.
 
+## Model-prompt data boundaries
+
+Every prompt sent to the memory-maintenance model (`src/engine/prompt.ts`)
+mixes trusted template text with untrusted reported data: bank entry
+`content`, `session.status`, transcript messages, and a tool's
+`tool_input`/`tool_response`/`error`. None of that data is written by this
+project — it originates from the action agent's own tool calls and from
+the memory model's own prior responses (which themselves echo tool
+output) — so it is treated as data to describe, never as instructions to
+follow, at two independent layers:
+
+- **Bank entry ids are a constrained slug, not free text.** `id` is
+  validated against `^[a-z0-9:_-]+$` at parse time (see ["Wire
+  formats"](#wire-formats)); an id outside that grammar is rejected, never
+  stored. Ids are rendered back into a *future* prompt verbatim
+  (`id="req:a"` in the bank listing), so constraining the character set
+  structurally means an id can never itself carry a quote or newline that
+  could reshape that future prompt's structure.
+- **Free-text values are rendered as escaped, quoted JSON string
+  literals, not spliced in raw.** Bank `content`, `session.status`,
+  transcript message text, and a tool's `error` message are all passed
+  through `JSON.stringify` before being placed in the prompt
+  (`quoteUntrusted()` in `src/engine/prompt.ts`). A value containing a
+  newline and a line that looks like `## Current tool event` cannot
+  manifest as an actual new prompt section — it stays inside one quoted,
+  escaped line. Every relevant prompt section header also says plainly
+  that its contents are untrusted reported data. `tool_input`/
+  `tool_response` (structured, not plain strings) get the equivalent
+  treatment via `safeJson()`, which already predates this change.
+
+**What this is and isn't.** This is a *structural* boundary: it guarantees
+untrusted text cannot forge fake prompt sections, tags, or delimiters by
+exploiting raw newlines/quotes. It is not, and cannot be, a guarantee that
+the model will never be *semantically* misled by something it reads
+inside a quoted string — no mechanical measure at the prompt-construction
+layer can fully prevent that for an LLM. The mechanical guards
+(["Mechanical guards"](#mechanical-guards-the-reminder-contract)) are the
+actual enforcement backstop regardless of what the model decides to do
+with untrusted content: a reminder is only ever trusted after it
+independently passes all six, checked against the database's own
+now-current state, not the model's claims about it.
+
 ## Fail-open design
 
 `src/bin/hook.ts`'s `main()` is structured so that no code path can print
@@ -401,11 +489,8 @@ anything other than JSON to stdout, and no code path can exit non-zero:
   suppressed at the process level before anything else runs
   (`src/lib/suppress-warnings.ts`, imported first) — stderr stays clean
   too, unless `PMS_DEBUG=1`.
-- Stdin is read with its own bounded timeout (`PMS_STDIN_TIMEOUT_MS`).
-- The whole engine call is raced against an outer wall-clock ceiling
-  (`PMS_OVERALL_TIMEOUT_MS`, default 18s — comfortably above the 15s hard
-  model-call cap, itself enforced twice: once when config is loaded and
-  again inside the HTTP adapter's own `AbortController`).
+- The whole invocation is bounded by a single time budget — see ["Time
+  budget"](#time-budget) immediately below for exactly how.
 - Every database write happens inside an explicit transaction
   (`src/db/transaction.ts`); a failure rolls back and a best-effort
   fallback write (`recordFastPathSilence` / `safeFallbackSilence` in
@@ -417,8 +502,11 @@ anything other than JSON to stdout, and no code path can exit non-zero:
   defeats every guard above still resolves to `process.exit(0)`.
 - Verified end-to-end, not just by code inspection: `test/bin/hook-cli.test.ts`
   spawns the real compiled CLI as a subprocess against malformed stdin, an
-  erroring model server, and a model server that hangs past the configured
-  timeout, and asserts exit code 0 and empty stdout in every case.
+  erroring model server, a model server that hangs past the configured
+  timeout, stdin that never arrives, and a SQLite write lock held open by
+  another connection — and asserts exit code 0, empty stdout, and (for the
+  last two) that the deadline — not the larger independently-configured
+  per-phase timeout — is what actually bounded the wait.
 - **"No hook output" scopes to stdout**, the channel Claude Code parses as
   the hook's JSON decision. One diagnostic is intentionally exempt from the
   `PMS_DEBUG` gate that governs every other log line: the absolute
@@ -429,6 +517,48 @@ anything other than JSON to stdout, and no code path can exit non-zero:
   stderr on exit 0 is not parsed as hook output, cannot block a tool call,
   and cannot change the (always-0) exit code.
 
+### Time budget
+
+**One deadline for the whole invocation, not one per phase.**
+`src/bin/hook.ts` creates a single `Deadline` (`src/lib/deadline.ts`,
+budget = `PMS_OVERALL_TIMEOUT_MS`, default/hard-capped at 15s — see
+["Model configuration"](#model-configuration)) immediately after config
+loads, and every phase below draws down the *same* remaining budget
+instead of getting its own independent allowance:
+
+- Stdin is read with a timeout of `min(PMS_STDIN_TIMEOUT_MS,
+  deadline.remainingMs())`.
+- The `busy_timeout` PRAGMA passed to `openDatabase()` is
+  `min(PMS_BUSY_TIMEOUT_MS, deadline.remainingMs())` — a SQLite lock wait
+  can only ever consume what's left of the budget, never its own
+  separately-configured ceiling on top of everything else.
+- The model request's `timeoutMs` (`src/engine/engine.ts`) is
+  `min(PMS_MODEL_TIMEOUT_MS, deadline.remainingMs())`; if the budget is
+  already exhausted by the time Phase A finishes, the model is never
+  called at all (zero network attempt, immediate fail-open with a logged
+  reason).
+- The whole engine call is additionally raced against
+  `deadline.remainingMs()` (not a static config value) as a final
+  backstop (`withOverallTimeout`).
+
+Net effect: the documented ~15-second sidecar budget is an invariant of
+the *entire* invocation (stdin + DB + model), not just of the model call
+in isolation — configuring a larger `PMS_STDIN_TIMEOUT_MS` or
+`PMS_BUSY_TIMEOUT_MS` can no longer make the process outlive it.
+
+**Caveat, stated precisely, not hidden.** This is enforced by cooperative
+checks between phases and by `AbortController` for the async model call —
+it cannot preempt a *synchronous* syscall already in flight (e.g.
+`mkdirSync`/`DatabaseSync` open against a hung or pathologically slow
+filesystem). `node:sqlite`'s `DatabaseSync` is fully synchronous, and Node
+is single-threaded: a truly stuck synchronous call blocks the entire
+process and cannot be interrupted by any in-process JS timer. That
+specific, narrow failure mode is a structural limit of this architecture
+(a synchronous DB driver in a single-threaded runtime), not a bug in the
+deadline logic — see limitation D8 below. In other words: this is a
+strong, tested guarantee for the overwhelmingly common case (a healthy
+local filesystem), not an absolute one for every pathological environment.
+
 ## Concurrency model
 
 Claude Code can fire `PostToolUse` for several tools in one parallel
@@ -438,10 +568,45 @@ hold a SQLite write transaction open across the (up to 15s) model call: it
 commits a small "Phase A" transaction (step increment, trigger-policy
 bookkeeping) first, makes the model call with no lock held, then opens a
 fresh "Phase B" transaction to apply Phase 1 edits and the Phase 2
-decision together. WAL mode plus a `busy_timeout` (default 5s) lets
-concurrent writers queue briefly instead of failing immediately; under
-sustained contention beyond that timeout, a step can legitimately degrade
-to silence rather than block the tool call — safe, logged, and rare.
+decision together. WAL mode plus a `busy_timeout` lets concurrent writers
+queue briefly instead of failing immediately (see ["Model
+configuration"](#model-configuration) — this is itself capped to the
+remaining overall deadline, not its own independent ceiling); under
+sustained contention beyond that, a step can legitimately degrade to
+silence rather than block the tool call — safe, logged, and rare.
+
+**Out-of-order Phase B commits are handled explicitly, not just avoided
+by holding a lock.** Because no lock is held across the model call, two
+concurrent steps' (up to 15s) model calls can settle in either order —
+the *later* step (higher `session.step_count`) can finish first, and the
+*earlier* step's response can arrive after it. Applying a stale response
+at that point would risk silently overwriting bank content, session
+status, or injection/cooldown bookkeeping the newer step already
+committed. `session_progress.committed_step` (an additive table, schema
+v2 — see `src/db/schema.ts`) is a durable per-session watermark: the
+highest step whose Phase B has actually committed. Every Phase B checks
+it, atomically with applying its own edits (SQLite write transactions are
+fully serialized via `BEGIN IMMEDIATE`, so the check-then-commit is
+race-free with no extra locking):
+
+- If a **higher** step has already committed, this response is
+  stale/out-of-order. Every mutation it would have made is suppressed —
+  no bank/status write, no injection bookkeeping, no stdout, even in live
+  mode — but the audit trail stays truthful: `bank_op_log` records each
+  op as attempted-but-superseded (`reason = 'stale_superseded'`),
+  `trigger_event.phase2_outcome = 'stale_superseded'` with an explanatory
+  `error`, and `intervention_log` still logs a real `silence` row with
+  the actual latency/token spend (the model call genuinely happened, it
+  just can't be trusted to land now).
+- Otherwise, the watermark advances to this step and Phase B applies
+  normally.
+
+This is a session-level, not per-entry, policy: a stale step's *entire*
+Phase B is suppressed as one unit, favoring simplicity and provable
+correctness (a single well-tested gate) over finer-grained per-entry
+merging. See `test/engine/engine.test.ts`'s "concurrency ordering" suite,
+which reproduces the out-of-order race deterministically with two
+deferred fake model calls settled in reverse-of-arrival order.
 
 ## Kill switch
 
@@ -519,9 +684,25 @@ Numbered for reference, not in priority order.
   long-term user-memory product.
 - **D7 — Contention can degrade to silence.** See ["Concurrency
   model"](#concurrency-model): under sustained parallel-tool-call
-  contention beyond `PMS_BUSY_TIMEOUT_MS`, a step can fail open into
-  silence purely due to a SQLite write-lock wait, independent of anything
-  about that step's actual content.
+  contention beyond `PMS_BUSY_TIMEOUT_MS` (itself further capped by
+  whatever remains of the overall deadline — see ["Fail-open
+  design"](#fail-open-design)), a step can fail open into silence purely
+  due to a SQLite write-lock wait, independent of anything about that
+  step's actual content. The same section also documents an explicit,
+  *non*-lock-contention case: a slower step's response arriving after a
+  faster, later step already committed is detected and suppressed too,
+  not just genuine lock timeouts.
+- **D8 — The time budget cannot preempt a stuck synchronous syscall.**
+  The single-deadline design (["Fail-open design"](#fail-open-design))
+  bounds every phase this project controls cooperatively, and bounds the
+  async model call with a real `AbortController`. It cannot bound a
+  synchronous filesystem call already in flight — `mkdirSync` or
+  `node:sqlite`'s `DatabaseSync` open against a hung or pathologically
+  slow disk/network mount blocks the single-threaded Node process outright
+  until that call returns, deadline or not. This is named here explicitly
+  rather than left implicit: the 15-second budget is a strong, tested
+  guarantee for the overwhelmingly common case (a healthy local
+  filesystem), not an absolute one for every pathological environment.
 - **Node.js version.** Requires `node:sqlite`, which shipped experimental
   and flagged in Node 22.5, then unflagged (still experimental-warned) in
   a later Node 22.x — this project was built and tested against Node
@@ -600,8 +781,11 @@ specified in the paper):**
   benchmark episodes are bounded and don't need an explicit bank ceiling
   or an explicit anti-redundancy threshold on top of the model's own
   judgment). They are this project's operational safeguards for
-  long-running or resumed sessions, all independently configurable and
-  all defaulting to the values named in the design brief.
+  long-running or resumed sessions, all defaulting to the values named in
+  the design brief and independently configurable — except the 100-token
+  reminder cap, which configuration may only ever *lower*, never raise
+  (see ["Mechanical guards"](#mechanical-guards-the-reminder-contract)):
+  that specific number is a product invariant, not just a tunable default.
 - **Mechanically-checked grounding, not just "memory-grounded" by
   convention.** The paper describes reminders as memory-grounded as a
   qualitative design property. This project turns that into a

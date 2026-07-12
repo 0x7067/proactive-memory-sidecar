@@ -92,6 +92,21 @@ describe("guard: token cap", () => {
     const failure = checkTokenCap(candidate, baseCtx({ maxTokens: 3 }));
     assert.equal(failure?.guard, "token_cap");
   });
+
+  test("a lower custom maxTokens can still tighten the cap below 100", () => {
+    const candidate: ReminderCandidate = { text: "one two three four five", groundingIds: ["req:a"] };
+    assert.equal(checkTokenCap(candidate, baseCtx({ maxTokens: 10 })), null, "5 words fits under 10");
+  });
+
+  test("the guard itself enforces the hard 100-token cap even if ctx.maxTokens claims a much larger allowance", () => {
+    // 150 short words is comfortably >100 tokens by the estimator, but well
+    // under a bogus/misconfigured ctx.maxTokens of 100000 — this proves the
+    // guard enforces its own hard ceiling rather than trusting the caller.
+    const longText = Array.from({ length: 150 }, (_, i) => `word${i}`).join(" ");
+    const candidate: ReminderCandidate = { text: longText, groundingIds: ["req:a"] };
+    const failure = checkTokenCap(candidate, baseCtx({ maxTokens: 100_000 }));
+    assert.equal(failure?.guard, "token_cap", "the hard 100-token ceiling must apply regardless of ctx.maxTokens");
+  });
 });
 
 describe("guard: no wall-clock time (replay safety)", () => {

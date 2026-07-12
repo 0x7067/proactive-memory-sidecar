@@ -96,6 +96,35 @@ CREATE INDEX IF NOT EXISTS idx_intervention_log_session_decision
 `;
 
 /**
+ * Version 2: `session_progress` — durable per-session bookkeeping that has
+ * no room in the mandated tables (`session`/`entry`/`intervention_log` may
+ * never gain columns — see AGENTS.md). One row per session, two
+ * independent monotonic counters:
+ *
+ *  - `committed_step`: the highest step whose Phase B (bank edits, session
+ *    status, and injection/cooldown bookkeeping) has actually committed
+ *    for this session. `processHookEvent` checks this *before* applying a
+ *    step's Phase 1 ops/Phase 2 decision and refuses to apply (and
+ *    refuses to advance the watermark) when the current step is behind
+ *    it — the durable, per-session ordering/conflict policy that stops a
+ *    slower, earlier step's response from overwriting state a later step
+ *    already committed. See README "Concurrency model".
+ *  - `post_tool_use_success_count`: counts only successful `PostToolUse`
+ *    events, so `PostToolUseFailure`/`PreCompact` can never shift *which*
+ *    `PostToolUse` call lands on the cadence-Nth tick. `session.step_count`
+ *    (mandated, unchanged) remains the all-event chronological step used
+ *    for ordering/auditing everywhere else (entry/trigger_event/
+ *    intervention_log primary keys). See README "Trigger policy".
+ */
+const SESSION_PROGRESS_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS session_progress (
+  session_id                   TEXT PRIMARY KEY REFERENCES session(session_id),
+  committed_step                INTEGER NOT NULL DEFAULT 0,
+  post_tool_use_success_count   INTEGER NOT NULL DEFAULT 0
+);
+`;
+
+/**
  * Idempotent schema initialization + forward-only migration runner, gated
  * on `PRAGMA user_version`. Safe to call on every connection open: a
  * database already at `SCHEMA_VERSION` does no writes beyond the pragma
@@ -113,12 +142,14 @@ export function initializeSchema(db: DatabaseSync): void {
 
   db.exec("BEGIN IMMEDIATE");
   try {
-    // Version 1: initial schema (mandated + auxiliary tables). Future
-    // schema changes should append `if (currentVersion < N) { ... }`
-    // blocks here rather than editing the SQL above in place.
+    // Each schema change appends its own `if (currentVersion < N) { ... }`
+    // block here rather than editing history in place.
     if (currentVersion < 1) {
       db.exec(MANDATED_SCHEMA_SQL);
       db.exec(AUXILIARY_SCHEMA_SQL);
+    }
+    if (currentVersion < 2) {
+      db.exec(SESSION_PROGRESS_SCHEMA_SQL);
     }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");

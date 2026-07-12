@@ -13,7 +13,8 @@
     "pms-maintain": "dist/src/bin/maintain.js"
   },
   "files": [
-    "dist",
+    "dist/src",
+    "!dist/src/**/*.map",
     "hooks",
     "README.md",
     "LICENSE"
