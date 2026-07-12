@@ -40,21 +40,21 @@ Then in `.claude/settings.json` (project-scoped, committable) or
       { "matcher": "*", "hooks": [
         { "type": "command", "command": "node",
           "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 20 }
+          "timeout": 17 }
       ]}
     ],
     "PostToolUseFailure": [
       { "matcher": "*", "hooks": [
         { "type": "command", "command": "node",
           "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 20 }
+          "timeout": 17 }
       ]}
     ],
     "PreCompact": [
       { "hooks": [
         { "type": "command", "command": "node",
           "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 20 }
+          "timeout": 17 }
       ]}
     ]
   }
@@ -83,7 +83,7 @@ This puts `pms-hook` and `pms-maintain` on `PATH`. Reference the bare
 command instead of `node <path>`:
 
 ```json
-{ "type": "command", "command": "pms-hook", "timeout": 20 }
+{ "type": "command", "command": "pms-hook", "timeout": 17 }
 ```
 
 ## 3. Configure the model adapter
@@ -123,17 +123,26 @@ few real sessions to inspect `intervention_log` (see the main README's
   step adds real latency (bounded — see below) to that one tool call; a
   non-triggered step (~most calls, since cadence defaults to every 4th
   call) adds negligible latency because no model call happens at all.
-- **`timeout: 20`** (seconds — Claude Code's hook `timeout` field is in
-  seconds, not milliseconds) gives headroom above the sidecar's own
-  internal ceiling: a single model call is hard-capped at 15s
-  (`HARD_MODEL_TIMEOUT_MS`, non-overridable upward), and the whole
-  invocation (model call + local SQLite work) is capped at 18s by default
-  (`PMS_OVERALL_TIMEOUT_MS`). The sidecar is designed to time out *itself*
-  before Claude Code's external hook timeout would ever fire, so that it
-  can still write a `silence` audit row and exit 0 cleanly instead of being
-  killed. If you lower `PMS_MODEL_TIMEOUT_MS`/`PMS_OVERALL_TIMEOUT_MS`,
-  you can safely lower this `timeout` field too; just keep it a few seconds
-  above `PMS_OVERALL_TIMEOUT_MS`.
+- **`timeout: 17`** (seconds — Claude Code's hook `timeout` field is in
+  seconds, not milliseconds) gives a small (2s) cleanup margin above the
+  sidecar's own internal ceiling: the *entire* invocation — stdin read,
+  SQLite open/contention, and the model call together, not just the model
+  call in isolation — is bounded by one deadline capped at 15s
+  (`PMS_OVERALL_TIMEOUT_MS`, hard-capped at `HARD_OVERALL_TIMEOUT_MS`; see
+  [the main README's "Time budget"](../README.md#time-budget)). The
+  sidecar is designed to time out *itself* well before Claude Code's
+  external hook timeout would ever fire, so that it can still write a
+  `silence` audit row and exit 0 cleanly instead of being killed
+  mid-write. 2 seconds is deliberately small, not generous padding:
+  process teardown (closing the SQLite handle, flushing stdout) is
+  expected to take low milliseconds, so this margin exists only to absorb
+  scheduling jitter, not to hide a slower design. If you lower
+  `PMS_OVERALL_TIMEOUT_MS`, you can safely lower this `timeout` field too;
+  just keep a couple of seconds of margin above it. One caveat carries
+  over from the main README unchanged: a truly stuck *synchronous*
+  filesystem call cannot be preempted by the sidecar's own deadline logic
+  either — see [the main README's "Time budget"](../README.md#time-budget)
+  and limitation D8 there.
 - **Fail-open, unconditionally.** Every error path — malformed stdin, an
   unreachable/erroring/slow model endpoint, a locked SQLite database, a
   bug in the sidecar itself — results in exit code `0` and empty stdout.
