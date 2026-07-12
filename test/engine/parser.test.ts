@@ -4,6 +4,11 @@ import { parseModelResponse, type ParseLimits } from "../../src/engine/parser.js
 
 const LIMITS: ParseLimits = { entryIdMaxChars: 128, entryContentMaxChars: 2000, statusMaxChars: 300 };
 
+/** Builds a well-formed <bank_ops> block from a real JSON.stringify of `ops`, so adversarial characters inside an id/content are escaped exactly the way a real model response would encode them. */
+function bankOpsBlock(ops: unknown[]): string {
+  return `<bank_ops>${JSON.stringify(ops)}</bank_ops>`;
+}
+
 describe("parser: Phase 1 (bank_ops)", () => {
   test("absent <bank_ops> block yields an empty op list, not an error", () => {
     const parsed = parseModelResponse("<no_intervention/>", LIMITS);
@@ -116,6 +121,81 @@ describe("parser: Phase 1 (bank_ops)", () => {
     const parsed = parseModelResponse(raw, LIMITS);
     const kinds = parsed.opEntries.map((e) => (e.valid ? e.op.op : "invalid"));
     assert.deepEqual(kinds, ["delete", "save_knowledge", "delete"]);
+  });
+});
+
+describe("parser: bank entry id grammar (conservative slug only)", () => {
+  test("accepts lowercase alphanumeric ids with ':', '_', '-'", () => {
+    const raw = bankOpsBlock([
+      { op: "save_knowledge", id: "req:ipv4-octets", content: "c" },
+      { op: "save_procedural", id: "proc_regex-fail_14", content: "c" },
+      { op: "save_knowledge", id: "abc123", content: "c" },
+    ]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.ok(
+      parsed.opEntries.every((e) => e.valid),
+      "every grammar-valid id must be accepted",
+    );
+  });
+
+  test("rejects an uppercase id", () => {
+    const raw = bankOpsBlock([{ op: "save_knowledge", id: "REQ:A", content: "c" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("rejects an id containing a newline", () => {
+    const raw = bankOpsBlock([{ op: "save_knowledge", id: "req:a\n## fake section", content: "c" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("rejects an id containing a double quote", () => {
+    const raw = bankOpsBlock([{ op: "save_knowledge", id: 'req:a"injected', content: "c" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("rejects an id containing a space", () => {
+    const raw = bankOpsBlock([{ op: "save_knowledge", id: "req a", content: "c" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("rejects an id containing punctuation outside the allowed set (e.g. '.', '/')", () => {
+    for (const id of ["req.a", "req/a", "req\\a", "req,a", "req;a"]) {
+      const raw = bankOpsBlock([{ op: "save_knowledge", id, content: "c" }]);
+      const parsed = parseModelResponse(raw, LIMITS);
+      assert.equal(parsed.opEntries[0]?.valid, false, `id "${id}" must be rejected`);
+    }
+  });
+
+  test("save_procedural is validated with the same grammar as save_knowledge", () => {
+    const raw = bankOpsBlock([{ op: "save_procedural", id: "Bad Id!", content: "c" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("delete also enforces the id grammar", () => {
+    const raw = bankOpsBlock([{ op: "delete", id: "not a valid id\nwith a newline" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, false);
+  });
+
+  test("delete accepts a grammar-valid id", () => {
+    const raw = bankOpsBlock([{ op: "delete", id: "req:ipv4-octets" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    assert.equal(parsed.opEntries[0]?.valid, true);
+  });
+
+  test("a grammar-invalid id is dropped, not silently sanitized/truncated to something valid", () => {
+    const raw = bankOpsBlock([{ op: "save_knowledge", id: "Req:A", content: "should not be stored" }]);
+    const parsed = parseModelResponse(raw, LIMITS);
+    const entry = parsed.opEntries[0];
+    assert.equal(entry?.valid, false);
+    if (entry && !entry.valid) {
+      assert.match(entry.reason, /id/i);
+    }
   });
 });
 

@@ -26,8 +26,46 @@ const NO_INTERVENTION_RE = /<no_intervention\s*\/>/i;
 const CONTEXT_FOR_ACTION_RE =
   /<context_for_action(?:\s+grounding="([^"]*)")?\s*>([\s\S]*?)<\/context_for_action>/i;
 
+/**
+ * Conservative slug grammar for bank entry ids: lowercase ASCII
+ * alphanumeric plus `:`, `_`, `-` only — never blank (enforced
+ * separately), never containing whitespace, quotes, or newlines. Ids are
+ * stored verbatim and later rendered back into a future prompt (see
+ * `src/engine/prompt.ts#renderBank`, `id="${e.id}"`); constraining the
+ * character set structurally means a model-controlled id can never itself
+ * carry a character that could reshape prompt structure, independent of
+ * (and in addition to) the JSON-escaping applied to free-text fields like
+ * `content`.
+ */
+const ENTRY_ID_RE = /^[a-z0-9:_-]+$/;
+
 function truncateForAudit(s: string, max = 300): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+type IdValidation = { ok: true; id: string } | { ok: false; reason: string };
+
+/**
+ * Validates and trims a raw `id` field against the shared bounded-length,
+ * conservative-grammar contract used by every op that carries an entry id
+ * (`save_knowledge`, `save_procedural`, `delete`). `delete` gains no
+ * functional benefit from the grammar today (a non-matching id can never
+ * have been stored by a prior `save_*`, so it would already be a
+ * not-found no-op) but is validated identically anyway for a single
+ * source of truth and a consistent audit trail.
+ */
+function validateEntryId(id: unknown, maxChars: number): IdValidation {
+  if (typeof id !== "string" || id.trim() === "") {
+    return { ok: false, reason: "id must be a non-empty string" };
+  }
+  const trimmed = id.trim();
+  if (trimmed.length > maxChars) {
+    return { ok: false, reason: `id exceeds ${maxChars} chars` };
+  }
+  if (!ENTRY_ID_RE.test(trimmed)) {
+    return { ok: false, reason: "id must be lowercase alphanumeric plus ':', '_', '-' only" };
+  }
+  return { ok: true, id: trimmed };
 }
 
 function validateOp(item: unknown, limits: ParseLimits): ParsedOpEntry {
@@ -49,29 +87,26 @@ function validateOp(item: unknown, limits: ParseLimits): ParsedOpEntry {
   }
 
   if (op === "save_knowledge" || op === "save_procedural") {
-    const id = item.id;
+    const idResult = validateEntryId(item.id, limits.entryIdMaxChars);
+    if (!idResult.ok) {
+      return { valid: false, raw: item, reason: `${op}.${idResult.reason}` };
+    }
     const content = item.content;
-    if (typeof id !== "string" || id.trim() === "") {
-      return { valid: false, raw: item, reason: `${op}.id must be a non-empty string` };
-    }
-    if (id.trim().length > limits.entryIdMaxChars) {
-      return { valid: false, raw: item, reason: `id exceeds ${limits.entryIdMaxChars} chars` };
-    }
     if (typeof content !== "string" || content.trim() === "") {
       return { valid: false, raw: item, reason: `${op}.content must be a non-empty string` };
     }
     if (content.trim().length > limits.entryContentMaxChars) {
       return { valid: false, raw: item, reason: `content exceeds ${limits.entryContentMaxChars} chars` };
     }
-    return { valid: true, op: { op, id: id.trim(), content: content.trim() } };
+    return { valid: true, op: { op, id: idResult.id, content: content.trim() } };
   }
 
   if (op === "delete") {
-    const id = item.id;
-    if (typeof id !== "string" || id.trim() === "") {
-      return { valid: false, raw: item, reason: "delete.id must be a non-empty string" };
+    const idResult = validateEntryId(item.id, limits.entryIdMaxChars);
+    if (!idResult.ok) {
+      return { valid: false, raw: item, reason: `delete.${idResult.reason}` };
     }
-    return { valid: true, op: { op: "delete", id: id.trim() } };
+    return { valid: true, op: { op: "delete", id: idResult.id } };
   }
 
   return { valid: false, raw: item, reason: `unrecognized op type ${JSON.stringify(op)}` };
