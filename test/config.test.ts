@@ -108,4 +108,15 @@ describe("loadConfig", () => {
     const config = loadConfig({ PMS_REMINDER_MAX_TOKENS: "40" });
     assert.equal(config.reminderMaxTokens, 40);
   });
+
+  test("overallTimeoutMs defaults to the documented 15-second sidecar budget, not 18s", () => {
+    const config = loadConfig({});
+    assert.equal(config.overallTimeoutMs, 15_000);
+  });
+
+  test("overallTimeoutMs cannot be configured above the 15-second hard ceiling", () => {
+    const config = loadConfig({ PMS_OVERALL_TIMEOUT_MS: "60000" });
+    assert.equal(config.overallTimeoutMs, 15_000);
+    assert.ok(config.warnings.some((w) => w.includes("PMS_OVERALL_TIMEOUT_MS")));
+  });
 });

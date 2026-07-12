@@ -52,8 +52,20 @@ export const HARD_MODEL_TIMEOUT_MS = 15_000;
 /** Default (overridable, but clamped to HARD_MODEL_TIMEOUT_MS) model call timeout. */
 export const DEFAULT_MODEL_TIMEOUT_MS = 15_000;
 
-/** Outer safety-net wall-clock ceiling for one whole hook invocation (model call + DB work). */
-export const DEFAULT_OVERALL_TIMEOUT_MS = 18_000;
+/**
+ * Absolute, non-overridable ceiling on the ENTIRE hook invocation — stdin
+ * read, SQLite open/contention, and the model call together — per the
+ * documented "15 second sidecar budget". Mirrors HARD_MODEL_TIMEOUT_MS's
+ * dual-enforcement pattern: clamped once when config is loaded
+ * (`src/config.ts`) and again, dynamically, against the single
+ * per-invocation `Deadline` (`src/lib/deadline.ts`) that `src/bin/hook.ts`
+ * threads through stdin/DB-open/the model call, so no phase can
+ * independently claim a larger slice of time than this ceiling allows.
+ */
+export const HARD_OVERALL_TIMEOUT_MS = 15_000;
+
+/** Outer safety-net wall-clock ceiling for one whole hook invocation (stdin + DB work + model call). */
+export const DEFAULT_OVERALL_TIMEOUT_MS = HARD_OVERALL_TIMEOUT_MS;
 
 /** How long we will wait to read the hook JSON payload from stdin before giving up. */
 export const DEFAULT_STDIN_TIMEOUT_MS = 5_000;

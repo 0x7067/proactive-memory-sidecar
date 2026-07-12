@@ -6,6 +6,7 @@ import { openDatabase } from "../db/connection.js";
 import { resolveDbPath } from "../db/paths.js";
 import { processHookEvent } from "../engine/engine.js";
 import { isSubagentEvent, parseHookPayload } from "../hook-io.js";
+import { createDeadline } from "../lib/deadline.js";
 import { debugLog, describeError } from "../lib/debug-log.js";
 import { HttpModelAdapter } from "../model/http-adapter.js";
 import type { EngineOutcome } from "../types.js";
@@ -77,7 +78,20 @@ async function main(): Promise<void> {
     debugLog(config, `config warning: ${w}`);
   }
 
-  const raw = await readStdin(config.stdinTimeoutMs);
+  // Single wall-clock deadline for this ENTIRE invocation, created as the
+  // first thing after config loads (config parsing is synchronous/instant,
+  // so this is effectively "at process entry"). Every phase below — stdin,
+  // SQLite open/contention, and the model call — is bounded by whatever
+  // remains of it, not by its own independent allowance: that's the actual
+  // fix for "configuration permits 18s overall / 20s hook / up to 60s
+  // SQLite busy wait" outliving the documented 15s sidecar budget. See
+  // README "Time budget and fail-open design" for the one caveat this
+  // cannot cover: a truly stuck *synchronous* syscall (e.g. a hung
+  // filesystem) blocks the whole single-threaded process and cannot be
+  // preempted by any in-process JS timer.
+  const deadline = createDeadline(config.overallTimeoutMs);
+
+  const raw = await readStdin(Math.min(config.stdinTimeoutMs, deadline.remainingMs()));
   if (raw === null || raw.trim() === "") {
     debugLog(config, "no stdin payload received within timeout");
     return;
@@ -102,24 +116,37 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (deadline.isExpired()) {
+    debugLog(config, "overall deadline already exhausted before DB open; failing open");
+    return;
+  }
+
   const dbPath = resolveDbPath(payload.cwd, config);
 
   let outcome: EngineOutcome = { stdoutJson: null };
   try {
-    const db = openDatabase(dbPath, config);
+    // Clamp the busy_timeout PRAGMA to whatever remains of the deadline —
+    // SQLite's own internal lock-wait retry loop is otherwise a
+    // synchronous, non-preemptible stall that could by itself outlast the
+    // whole budget (see README "Concurrency model").
+    const db = openDatabase(dbPath, { busyTimeoutMs: Math.min(config.busyTimeoutMs, deadline.remainingMs()) });
     try {
-      const modelAdapter = new HttpModelAdapter({
-        provider: config.model.provider,
-        baseUrl: config.model.baseUrl,
-        apiKey: config.model.apiKey,
-        modelName: config.model.modelName,
-      });
+      if (deadline.isExpired()) {
+        debugLog(config, "overall deadline exhausted while opening the database; failing open");
+      } else {
+        const modelAdapter = new HttpModelAdapter({
+          provider: config.model.provider,
+          baseUrl: config.model.baseUrl,
+          apiKey: config.model.apiKey,
+          modelName: config.model.modelName,
+        });
 
-      outcome = await withOverallTimeout(
-        processHookEvent(payload, { db, modelAdapter, config }),
-        config.overallTimeoutMs,
-        { stdoutJson: null },
-      );
+        outcome = await withOverallTimeout(
+          processHookEvent(payload, { db, modelAdapter, config, deadline }),
+          deadline.remainingMs(),
+          { stdoutJson: null },
+        );
+      }
     } finally {
       try {
         db.close();

@@ -285,7 +285,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
       env.PMS_OVERALL_TIMEOUT_MS,
       constants.DEFAULT_OVERALL_TIMEOUT_MS,
       modelTimeoutMs,
-      120_000,
+      constants.HARD_OVERALL_TIMEOUT_MS,
       warnings,
       "PMS_OVERALL_TIMEOUT_MS",
     ),

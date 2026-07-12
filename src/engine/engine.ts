@@ -260,40 +260,54 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
   let tokensOut: number | null = null;
   let modelError: string | null = null;
 
-  try {
-    const session = getSession(db, sessionId);
-    const liveEntries = listLiveEntries(db, sessionId);
-    const transcriptTail = readTranscriptTail(payload.transcript_path, config.transcriptTailK);
+  // Single per-invocation deadline (see src/lib/deadline.ts / src/bin/hook.ts):
+  // the model call's own timeout must never exceed whatever remains of the
+  // overall hook budget, and if that budget is already gone (stdin read
+  // and/or DB open/contention already consumed it), skip the call entirely
+  // rather than start a request we already know cannot finish in time.
+  // Absent an injected deadline (e.g. most unit tests), this is unbounded
+  // and behavior is unchanged from `config.model.timeoutMs`.
+  const remainingForModel = deps.deadline ? deps.deadline.remainingMs() : Number.POSITIVE_INFINITY;
 
-    const { system, user } = buildPrompt({
-      hookEvent,
-      step: newStep,
-      cadenceN: config.cadenceN,
-      triggerReason: triggerDecision.reason,
-      forced: triggerDecision.forced,
-      phase2Eligible: triggerDecision.phase2Eligible,
-      sessionStatus: session?.status ?? "",
-      bankCap: config.bankCap,
-      liveEntries,
-      transcriptTail,
-      toolEvent,
-      reminderMaxTokens: config.reminderMaxTokens,
-      cooldownSteps: config.cooldownSteps,
-      similarityThreshold: config.similarityThreshold,
-    });
+  if (remainingForModel <= 0) {
+    modelError = "overall hook time budget was already exhausted before the model call";
+    debugLog(config, "deadline exhausted before model call; degrading to silence", modelError);
+  } else {
+    try {
+      const session = getSession(db, sessionId);
+      const liveEntries = listLiveEntries(db, sessionId);
+      const transcriptTail = readTranscriptTail(payload.transcript_path, config.transcriptTailK);
 
-    const response = await modelAdapter.complete({
-      systemPrompt: system,
-      userPrompt: user,
-      maxOutputTokens: config.model.maxOutputTokens,
-      timeoutMs: config.model.timeoutMs,
-    });
-    modelText = response.text;
-    tokensIn = response.usage.tokensIn;
-    tokensOut = response.usage.tokensOut;
-  } catch (err) {
-    modelError = describeError(err);
-    debugLog(config, "model call failed; degrading to silence", modelError);
+      const { system, user } = buildPrompt({
+        hookEvent,
+        step: newStep,
+        cadenceN: config.cadenceN,
+        triggerReason: triggerDecision.reason,
+        forced: triggerDecision.forced,
+        phase2Eligible: triggerDecision.phase2Eligible,
+        sessionStatus: session?.status ?? "",
+        bankCap: config.bankCap,
+        liveEntries,
+        transcriptTail,
+        toolEvent,
+        reminderMaxTokens: config.reminderMaxTokens,
+        cooldownSteps: config.cooldownSteps,
+        similarityThreshold: config.similarityThreshold,
+      });
+
+      const response = await modelAdapter.complete({
+        systemPrompt: system,
+        userPrompt: user,
+        maxOutputTokens: config.model.maxOutputTokens,
+        timeoutMs: Math.min(config.model.timeoutMs, remainingForModel),
+      });
+      modelText = response.text;
+      tokensIn = response.usage.tokensIn;
+      tokensOut = response.usage.tokensOut;
+    } catch (err) {
+      modelError = describeError(err);
+      debugLog(config, "model call failed; degrading to silence", modelError);
+    }
   }
 
   if (modelError !== null) {

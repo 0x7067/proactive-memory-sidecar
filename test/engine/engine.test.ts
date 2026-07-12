@@ -2,9 +2,20 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { processHookEvent } from "../../src/engine/engine.js";
 import type { Config } from "../../src/config.js";
+import type { Deadline } from "../../src/lib/deadline.js";
 import { DeferredModelAdapter, FakeModelAdapter } from "../helpers/fake-model-adapter.js";
 import { buildTestConfig, makePostToolUseFailurePayload, makePostToolUsePayload, makePreCompactPayload } from "../helpers/fixtures.js";
 import { openTempDb, type TempDb } from "../helpers/tmp-db.js";
+
+/** A Deadline stub with a fixed remainingMs()/isExpired() answer, for deterministic tests with no real timers. */
+function fixedDeadline(remainingMs: number): Deadline {
+  return {
+    startedAt: 0,
+    deadlineAt: remainingMs,
+    remainingMs: () => Math.max(0, remainingMs),
+    isExpired: () => remainingMs <= 0,
+  };
+}
 
 function getTriggerEvent(tmp: TempDb, sessionId: string, step: number): Record<string, unknown> | undefined {
   return tmp.db.prepare("SELECT * FROM trigger_event WHERE session_id = ? AND step = ?").get(sessionId, step);
@@ -534,5 +545,80 @@ describe("engine: cadence counts only successful PostToolUse events", () => {
       { db: tmp.db, modelAdapter: model, config },
     );
     assert.equal(model.calls.length, 2, "this is the 3rd successful PostToolUse and must be due");
+  });
+});
+
+describe("engine: time budget / deadline propagation", () => {
+  let tmp: TempDb;
+  let config: Config;
+
+  beforeEach(() => {
+    tmp = openTempDb();
+    config = buildTestConfig({ PMS_MODE: "live", PMS_CADENCE_N: "1" });
+  });
+  afterEach(() => tmp.cleanup());
+
+  test("the model call is skipped entirely and the step fails open when the deadline is already exhausted", async () => {
+    const model = new FakeModelAdapter(["<bank_ops>[]</bank_ops>\n<no_intervention/>"]);
+    const outcome = await processHookEvent(makePostToolUsePayload({ session_id: "s1" }), {
+      db: tmp.db,
+      modelAdapter: model,
+      config,
+      deadline: fixedDeadline(0),
+    });
+    assert.equal(model.calls.length, 0, "the model must never be called once the deadline is already exhausted");
+    assert.equal(outcome.stdoutJson, null);
+
+    const log = getInterventionLog(tmp, "s1", 1);
+    assert.equal(log?.decision, "silence");
+    const trig = getTriggerEvent(tmp, "s1", 1);
+    assert.match(trig?.error as string, /deadline|budget/i);
+  });
+
+  test("the model request's timeoutMs is clamped to the deadline's remaining budget, not the full configured model timeout", async () => {
+    const configWithLongModelTimeout = buildTestConfig({
+      PMS_MODE: "live",
+      PMS_CADENCE_N: "1",
+      PMS_MODEL_TIMEOUT_MS: "15000",
+    });
+    const model = new FakeModelAdapter(["<bank_ops>[]</bank_ops>\n<no_intervention/>"]);
+    await processHookEvent(makePostToolUsePayload({ session_id: "s1" }), {
+      db: tmp.db,
+      modelAdapter: model,
+      config: configWithLongModelTimeout,
+      deadline: fixedDeadline(250),
+    });
+    assert.equal(model.calls.length, 1);
+    assert.equal(
+      model.calls[0]?.timeoutMs,
+      250,
+      "the request timeout must be clamped to the deadline's remaining budget",
+    );
+  });
+
+  test("without an injected deadline, the model call uses the full configured timeout (backward compatible)", async () => {
+    const configWithCustomModelTimeout = buildTestConfig({
+      PMS_MODE: "live",
+      PMS_CADENCE_N: "1",
+      PMS_MODEL_TIMEOUT_MS: "12345",
+    });
+    const model = new FakeModelAdapter(["<bank_ops>[]</bank_ops>\n<no_intervention/>"]);
+    await processHookEvent(makePostToolUsePayload({ session_id: "s1" }), {
+      db: tmp.db,
+      modelAdapter: model,
+      config: configWithCustomModelTimeout,
+    });
+    assert.equal(model.calls[0]?.timeoutMs, 12345);
+  });
+
+  test("a deadline with ample remaining budget does not shrink a shorter configured model timeout", async () => {
+    const model = new FakeModelAdapter(["<bank_ops>[]</bank_ops>\n<no_intervention/>"]);
+    await processHookEvent(makePostToolUsePayload({ session_id: "s1" }), {
+      db: tmp.db,
+      modelAdapter: model,
+      config, // PMS_MODEL_TIMEOUT_MS default (15000)
+      deadline: fixedDeadline(999_999),
+    });
+    assert.equal(model.calls[0]?.timeoutMs, config.model.timeoutMs);
   });
 });
