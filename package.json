@@ -1,0 +1,38 @@
+{
+  "name": "proactive-memory-sidecar",
+  "version": "0.1.0",
+  "description": "A local-only, no-external-service proactive memory sidecar for Claude Code hooks: maintains a per-session SQLite memory bank and selectively injects short, fact-only, bank-grounded reminders into the action agent.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "pms-hook": "dist/src/bin/hook.js",
+    "pms-maintain": "dist/src/bin/maintain.js"
+  },
+  "files": [
+    "dist",
+    "hooks",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "test:only": "node --test \"dist/test/**/*.test.js\"",
+    "verify": "npm run typecheck && npm run lint && npm run build && node --test \"dist/test/**/*.test.js\""
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.38.0",
+    "@types/node": "^22.20.1",
+    "eslint": "^9.38.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.63.0"
+  }
+}
