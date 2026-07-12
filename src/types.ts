@@ -35,6 +35,14 @@ export interface PostToolUsePayload extends CommonHookFields {
   tool_name: string;
   tool_input: unknown;
   tool_response: unknown;
+  /**
+   * Codex reports failed tools through PostToolUse (rather than a separate
+   * PostToolUseFailure event). This normalized flag preserves the harness
+   * event name for stdout while giving trigger policy failure semantics.
+   */
+  tool_failed: boolean;
+  /** Best-effort description derived from a Codex failed tool response. */
+  error: string | undefined;
   tool_use_id: string | undefined;
   duration_ms: number | undefined;
 }

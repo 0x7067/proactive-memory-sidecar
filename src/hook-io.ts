@@ -24,6 +24,27 @@ function bool(v: unknown): boolean | undefined {
 }
 
 /**
+ * Codex emits a PostToolUse event for both successful and failed tool calls.
+ * Normalize documented/common response failure signals without changing the
+ * original hook event name, which must stay PostToolUse in hook stdout.
+ */
+function codexToolFailure(response: unknown): { failed: boolean; error: string | undefined } {
+  if (!isRecord(response)) return { failed: false, error: undefined };
+
+  const exitCode = typeof response.exit_code === "number"
+    ? response.exit_code
+    : typeof response.exitCode === "number"
+      ? response.exitCode
+      : undefined;
+  const failed = response.success === false || response.is_error === true || (exitCode !== undefined && exitCode !== 0);
+  if (!failed) return { failed: false, error: undefined };
+
+  const detail = str(response.error) ?? str(response.stderr);
+  const prefix = exitCode !== undefined ? `tool exited with code ${exitCode}` : "tool reported failure";
+  return { failed: true, error: detail ? `${prefix}: ${detail}` : prefix };
+}
+
+/**
  * Validates and normalizes an arbitrary parsed-JSON value into a
  * `HookPayload`, or returns `null` if it isn't shaped like one of the three
  * events this sidecar handles (missing required fields, or an
@@ -47,12 +68,15 @@ export function parseHookPayload(raw: unknown): HookPayload | null {
 
   if (raw.hook_event_name === "PostToolUse") {
     if (typeof raw.tool_name !== "string") return null;
+    const failure = codexToolFailure(raw.tool_response);
     return {
       ...common,
       hook_event_name: "PostToolUse",
       tool_name: raw.tool_name,
       tool_input: raw.tool_input,
       tool_response: raw.tool_response,
+      tool_failed: failure.failed,
+      error: failure.error,
       tool_use_id: str(raw.tool_use_id),
       duration_ms: num(raw.duration_ms),
     };

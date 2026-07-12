@@ -15,6 +15,8 @@ export interface TriggerPolicyInput {
   cadenceN: number;
   /** Precomputed by the caller via `isNearDuplicateToolCall` — only meaningful for PostToolUse. */
   isNearDuplicate: boolean;
+  /** True when a harness reports a failed tool through a PostToolUse event (Codex behavior). */
+  toolFailed?: boolean;
 }
 
 /**
@@ -39,7 +41,7 @@ export function decideTrigger(input: TriggerPolicyInput): TriggerDecision {
     return { triggered: true, forced: true, reason: "precompact_sweep", phase2Eligible: false };
   }
 
-  if (input.hookEvent === "PostToolUseFailure") {
+  if (input.hookEvent === "PostToolUseFailure" || input.toolFailed) {
     return { triggered: true, forced: true, reason: "forced_failure", phase2Eligible: true };
   }
 

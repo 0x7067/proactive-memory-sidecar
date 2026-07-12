@@ -220,6 +220,31 @@ Reminder: the task requires X, as established earlier.
     assert.equal(parsed.hookSpecificOutput.additionalContext, "Reminder: the task requires X, as established earlier.");
   });
 
+  test("Codex failed PostToolUse forces a reminder while preserving the PostToolUse output event", async () => {
+    handler = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          content: [
+            {
+              type: "text",
+              text: `<bank_ops>[{"op":"save_procedural","id":"proc:codex-failure","content":"The Codex Bash command exited with code 1."}]</bank_ops>
+<context_for_action grounding="proc:codex-failure">The Codex Bash command previously exited with code 1.</context_for_action>`,
+            },
+          ],
+        }),
+      );
+    };
+    const result = await runHook(
+      postToolUsePayload({ tool_response: { exit_code: 1, stderr: "intentional failure" } }),
+      baseEnv({ PMS_MODE: "live", PMS_CADENCE_N: "99" }),
+      projectDir,
+    );
+    assert.equal(result.exitCode, 0);
+    const parsed = JSON.parse(result.stdout.trim()) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
+    assert.equal(parsed.hookSpecificOutput.additionalContext, "The Codex Bash command previously exited with code 1.");
+  });
+
   test("PreCompact never emits additionalContext even in live mode", async () => {
     handler = (_req, res) => {
       res.writeHead(200, { "content-type": "application/json" }).end(

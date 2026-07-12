@@ -1,7 +1,7 @@
 {
   "name": "proactive-memory-sidecar",
   "version": "0.1.0",
-  "description": "A local-only, no-external-service proactive memory sidecar for Claude Code hooks: maintains a per-session SQLite memory bank and selectively injects short, fact-only, bank-grounded reminders into the action agent.",
+  "description": "A local-only, no-external-service proactive memory sidecar for Claude Code and Codex CLI hooks: maintains a per-session SQLite memory bank and selectively injects short, fact-only, bank-grounded reminders into the action agent.",
   "license": "MIT",
   "type": "module",
   "private": true,

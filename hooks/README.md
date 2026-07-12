@@ -86,6 +86,23 @@ command instead of `node <path>`:
 { "type": "command", "command": "pms-hook", "timeout": 17 }
 ```
 
+## Codex CLI attachment
+
+Codex uses `.codex/hooks.json`, not Claude settings. Copy
+[`codex.hooks.example.json`](./codex.hooks.example.json) into the target
+project's `.codex/hooks.json`, replace its absolute path placeholder, and set:
+
+```bash
+export PMS_DB_RELATIVE_PATH=.codex/pms/bank.sqlite3
+```
+
+The Codex template registers only `PostToolUse` and `PreCompact`: Codex sends
+failed supported tool executions as `PostToolUse` with a failed response, and
+the sidecar normalizes `exit_code` / `exitCode`, `success: false`, and
+`is_error: true` into its existing forced-failure trigger. Its output still
+uses `hookEventName: "PostToolUse"`, as required by Codex. Review and trust
+the command hook through Codex's `/hooks` interface before it runs.
+
 ## 3. Configure the model adapter
 
 The hook makes at most one model call per triggered step, and none at all
