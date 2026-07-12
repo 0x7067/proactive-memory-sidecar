@@ -1,3 +1,4 @@
+import { HARD_REMINDER_MAX_TOKENS } from "../constants.js";
 import type { EntryRow, GuardEvaluation, GuardFailure } from "../types.js";
 import { trigramSimilarity } from "../lib/trigram-similarity.js";
 import { estimateTokens } from "./tokenizer.js";
@@ -36,11 +37,19 @@ export function checkGrounding(candidate: ReminderCandidate, ctx: GuardContext):
   return null;
 }
 
-/** Guard 2/6 — <=100 (configurable) estimated tokens. */
+/**
+ * Guard 2/6 — <=100 (configurable, but never more than
+ * `HARD_REMINDER_MAX_TOKENS`) estimated tokens. The hard ceiling is
+ * enforced here directly, not just at config-load time
+ * (`src/config.ts`), so this guard is itself a real product invariant
+ * regardless of what `ctx.maxTokens` claims — mirroring the dual
+ * enforcement `HARD_MODEL_TIMEOUT_MS` gets in `src/model/http-adapter.ts`.
+ */
 export function checkTokenCap(candidate: ReminderCandidate, ctx: GuardContext): GuardFailure | null {
+  const effectiveMax = Math.min(ctx.maxTokens, HARD_REMINDER_MAX_TOKENS);
   const n = estimateTokens(candidate.text);
-  if (n > ctx.maxTokens) {
-    return { guard: "token_cap", reason: `estimated ${n} tokens exceeds cap of ${ctx.maxTokens}` };
+  if (n > effectiveMax) {
+    return { guard: "token_cap", reason: `estimated ${n} tokens exceeds cap of ${effectiveMax}` };
   }
   return null;
 }

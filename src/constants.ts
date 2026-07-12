@@ -27,6 +27,16 @@ export const DEFAULT_TRANSCRIPT_TAIL_K = 8;
 /** Mechanically enforced reminder length ceiling, in conservatively-estimated tokens. */
 export const DEFAULT_REMINDER_MAX_TOKENS = 100;
 
+/**
+ * Absolute, non-overridable ceiling on the reminder token cap — the
+ * product invariant is "a maximum 100-token reminder"; configuration may
+ * only ever lower this, never raise it. Enforced twice, mirroring the
+ * model-timeout pattern: once when config is loaded (`src/config.ts`) and
+ * again inside the guard itself (`checkTokenCap` in `src/engine/guards.ts`)
+ * so a misconfigured/future caller can never bypass it.
+ */
+export const HARD_REMINDER_MAX_TOKENS = 100;
+
 /** How many previously-logged reminders (any shadow state) to compare a new candidate against. */
 export const DEFAULT_SIMILARITY_HISTORY_WINDOW = 10;
 

@@ -228,7 +228,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
       env.PMS_REMINDER_MAX_TOKENS,
       constants.DEFAULT_REMINDER_MAX_TOKENS,
       1,
-      100_000,
+      constants.HARD_REMINDER_MAX_TOKENS,
       warnings,
       "PMS_REMINDER_MAX_TOKENS",
     ),

@@ -97,4 +97,15 @@ describe("loadConfig", () => {
     const config = loadConfig({ PMS_MODEL_TIMEOUT_MS: "15000", PMS_OVERALL_TIMEOUT_MS: "100" });
     assert.ok(config.overallTimeoutMs >= config.model.timeoutMs);
   });
+
+  test("reminderMaxTokens is clamped to the hard 100-token ceiling even if a much larger value is requested", () => {
+    const config = loadConfig({ PMS_REMINDER_MAX_TOKENS: "100000" });
+    assert.equal(config.reminderMaxTokens, 100);
+    assert.ok(config.warnings.some((w) => w.includes("PMS_REMINDER_MAX_TOKENS")));
+  });
+
+  test("reminderMaxTokens may be lowered below 100", () => {
+    const config = loadConfig({ PMS_REMINDER_MAX_TOKENS: "40" });
+    assert.equal(config.reminderMaxTokens, 40);
+  });
 });
