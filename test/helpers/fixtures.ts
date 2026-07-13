@@ -23,6 +23,8 @@ export function makePostToolUsePayload(overrides: Partial<PostToolUsePayload> = 
     tool_name: "Bash",
     tool_input: { command: "echo hi" },
     tool_response: { success: true },
+    tool_failed: false,
+    error: undefined,
     tool_use_id: undefined,
     duration_ms: 12,
     ...overrides,

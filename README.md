@@ -1,12 +1,11 @@
 # proactive-memory-sidecar
 
 A local-only, no-external-service **proactive memory sidecar** for Claude
-Code hooks. It maintains a per-session, project-local SQLite memory bank
-and selectively injects short, fact-only, bank-grounded reminders into the
-action agent after tool events — or stays silent, which is the common
-case. The action agent (Claude Code itself) is completely unmodified; the
-sidecar only ever adds a small amount of optional context via the
-documented `additionalContext` hook mechanism.
+Code and Codex CLI hooks. It maintains a per-session, project-local SQLite
+memory bank and selectively injects short, fact-only, bank-grounded reminders
+into the action agent after tool events — or stays silent, which is the common
+case. The action agent remains unmodified; the sidecar only adds optional
+context through the harness's documented `additionalContext` hook mechanism.
 
 It **fails open**: every error, timeout, or misconfiguration results in
 exit code `0` and no hook output. Nothing here can block a tool call, deny
@@ -114,6 +113,34 @@ npm install && npm run build              # produces dist/src/bin/hook.js
 then add the block from [`hooks/settings.example.json`](hooks/settings.example.json)
 to your target project's `.claude/settings.json`, pointing `args` at your
 `dist/src/bin/hook.js`.
+
+### Codex CLI
+
+Codex uses the same stdin JSON and `additionalContext` output contract, but
+registers command hooks in `<project>/.codex/hooks.json`. Copy
+[`hooks/codex.hooks.example.json`](hooks/codex.hooks.example.json), replace
+`/absolute/path/to/proactive-memory-sidecar` with this checkout's absolute
+path, and set the sidecar database location for the Codex project layer:
+
+```bash
+mkdir -p /path/to/your/project/.codex
+cp /path/to/proactive-memory-sidecar/hooks/codex.hooks.example.json \
+  /path/to/your/project/.codex/hooks.json
+# Edit .codex/hooks.json and replace the placeholder absolute path.
+export PMS_DB_RELATIVE_PATH=.codex/pms/bank.sqlite3
+```
+
+The template attaches to Codex `PostToolUse` and `PreCompact`. Codex reports
+both successful and unsuccessful supported tool calls through `PostToolUse`;
+the sidecar recognizes `exit_code` / `exitCode`, `success: false`, and
+`is_error: true` response signals as a forced failure trigger while preserving
+`PostToolUse` in its output. This keeps Codex's hook wire format valid and
+ensures failures do not advance the successful-call cadence counter.
+
+Codex requires project-local command hooks to be reviewed and trusted. Open
+`/hooks` in Codex to review and trust the copied hook definition before use.
+See the [Codex hooks documentation](https://developers.openai.com/codex/hooks)
+for config-layer and trust behavior.
 
 ## Model configuration
 

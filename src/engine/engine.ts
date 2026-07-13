@@ -59,7 +59,7 @@ function extractToolEvent(payload: HookPayload): PromptToolEvent {
       toolName: payload.tool_name,
       toolInput: payload.tool_input ?? null,
       toolResponse: payload.tool_response ?? null,
-      error: null,
+      error: payload.error ?? null,
     };
   }
   if (payload.hook_event_name === "PostToolUseFailure") {
@@ -210,13 +210,14 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       // all-event chronological ordering key for entry/trigger_event/
       // intervention_log — only the cadence *decision* uses this counter.
       const postToolUseSuccessCount =
-        hookEvent === "PostToolUse" ? incrementPostToolUseSuccessCount(db, sessionId) : 0;
+        hookEvent === "PostToolUse" && !payload.tool_failed ? incrementPostToolUseSuccessCount(db, sessionId) : 0;
 
       const decision = decideTrigger({
         hookEvent,
         postToolUseSuccessCount,
         cadenceN: config.cadenceN,
         isNearDuplicate: isNearDup,
+        toolFailed: hookEvent === "PostToolUse" && payload.tool_failed,
       });
 
       recordTriggerEvent(db, {
@@ -227,7 +228,11 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
         forced: decision.forced,
         toolName: toolEvent.toolName,
         inputSig: toolInputSig,
-        ok: hookEvent === "PostToolUseFailure" ? false : hookEvent === "PostToolUse" ? true : null,
+        ok: hookEvent === "PostToolUseFailure" || (hookEvent === "PostToolUse" && payload.tool_failed)
+          ? false
+          : hookEvent === "PostToolUse"
+            ? true
+            : null,
         createdAt: startMs,
       });
 

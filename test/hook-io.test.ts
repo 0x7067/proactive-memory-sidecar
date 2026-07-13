@@ -69,6 +69,23 @@ describe("parseHookPayload", () => {
     );
   });
 
+  test("Codex PostToolUse with a non-zero exit_code is normalized as a tool failure", () => {
+    const payload = parseHookPayload({
+      session_id: "codex-session",
+      cwd: "/proj",
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "false" },
+      tool_response: { exit_code: 1, stderr: "intentional failure" },
+      turn_id: "turn-1",
+    });
+    assert.ok(payload);
+    if (payload?.hook_event_name === "PostToolUse") {
+      assert.equal(payload.tool_failed, true);
+      assert.match(payload.error ?? "", /code 1/i);
+    }
+  });
+
   test("valid PostToolUseFailure payload parses with error fields", () => {
     const payload = parseHookPayload({
       session_id: "s1",

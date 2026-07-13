@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/proactive-memory-sidecar/dist/src/bin/hook.js",
+            "timeout": 17,
+            "statusMessage": "Updating proactive memory"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/proactive-memory-sidecar/dist/src/bin/hook.js",
+            "timeout": 17,
+            "statusMessage": "Preserving proactive memory"
+          }
+        ]
+      }
+    ]
+  }
+}
