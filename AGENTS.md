@@ -4,11 +4,11 @@ Instructions for any agent (or human) working in this repository.
 
 ## What this is
 
-A local-only, no-external-service sidecar for Claude Code hooks. It
-maintains a per-session SQLite memory bank and selectively injects short,
-fact-only reminders into the action agent. See `README.md` for the full
-design and `hooks/README.md` for install/attach instructions. This file is
-about *working on the sidecar's own code*, not about using it.
+A local-only, no-external-service sidecar for Claude Code and Codex CLI
+hooks. It maintains a per-session SQLite memory bank and selectively
+injects short, fact-only reminders into the action agent. See `README.md`
+for the full design and `hooks/README.md` for install/attach instructions.
+This file is about *working on the sidecar's own code*, not about using it.
 
 ## Local commands
 
@@ -119,6 +119,15 @@ if you touch code near it.
     independent `PMS_*_TIMEOUT_MS` that isn't itself capped by
     `deadline.remainingMs()`, or the 15s whole-invocation budget
     (README "Fail-open design") silently stops being a real ceiling again.
+12. **Preserve each harness's event semantics.** Claude Code reports tool
+    failures as `PostToolUseFailure`; Codex reports both successful and
+    unsuccessful supported tool calls as `PostToolUse`. Codex failure
+    signals (`exit_code` / `exitCode`, `success: false`, or
+    `is_error: true`) are normalized by `src/hook-io.ts` into the same
+    forced-trigger behavior while `outputHookEventName` remains
+    `PostToolUse`, because the emitted `hookEventName` must stay valid for
+    the originating harness. Keep this normalization mechanical and cover
+    any new failure signal in parser, engine, and CLI-subprocess tests.
 
 ## Repo layout
 
@@ -142,7 +151,8 @@ src/
   hook-io.ts      hook payload validation + subagent-event detection
 test/             mirrors src/ one-for-one, plus helpers/ (fakes/fixtures) and
                   bin/ (end-to-end subprocess tests against the real compiled CLI)
-hooks/            settings.example.json + install walkthrough for consumers
+hooks/            Claude settings + Codex hooks templates and install walkthrough
+                  for consumers
 ```
 
 ## Style
