@@ -117,7 +117,7 @@ describe("hook CLI (end-to-end subprocess)", () => {
   }
 
   function dbPath(): string {
-    return join(projectDir, ".claude", "pms", "bank.sqlite3");
+    return join(projectDir, ".proactive-memory", "bank.sqlite3");
   }
 
   test("exits 0 with empty stdout for a fast-path (non-triggering) call, and creates the db", async () => {
@@ -235,7 +235,7 @@ Reminder: the task requires X, as established earlier.
       );
     };
     const result = await runHook(
-      postToolUsePayload({ tool_response: { exit_code: 1, stderr: "intentional failure" } }),
+      postToolUsePayload({ turn_id: "turn-codex-1", tool_response: { exit_code: 1, stderr: "intentional failure" } }),
       baseEnv({ PMS_MODE: "live", PMS_CADENCE_N: "99" }),
       projectDir,
     );
@@ -243,6 +243,60 @@ Reminder: the task requires X, as established earlier.
     const parsed = JSON.parse(result.stdout.trim()) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
     assert.equal(parsed.hookSpecificOutput.additionalContext, "The Codex Bash command previously exited with code 1.");
+    const db = new DatabaseSync(dbPath());
+    try {
+      const metric = db.prepare("SELECT harness, emitted_reminder FROM effectiveness_metric WHERE session_id = 's1' AND step = 1").get() as
+        | { harness: string; emitted_reminder: number }
+        | undefined;
+      assert.deepEqual({ ...metric }, { harness: "codex", emitted_reminder: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
+  test("Claude PostToolUseFailure emits the Claude wire event and records its harness", async () => {
+    handler = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          content: [
+            {
+              type: "text",
+              text: `<bank_ops>[{"op":"save_procedural","id":"proc:claude-failure","content":"The Claude Bash command exited with code 1."}]</bank_ops>
+<context_for_action grounding="proc:claude-failure">The Claude Bash command previously exited with code 1.</context_for_action>`,
+            },
+          ],
+        }),
+      );
+    };
+    const result = await runHook(
+      JSON.stringify({
+        session_id: "s1",
+        cwd: projectDir,
+        hook_event_name: "PostToolUseFailure",
+        tool_name: "Bash",
+        tool_input: { command: "false" },
+        error: "intentional failure",
+      }),
+      baseEnv({ PMS_MODE: "live", PMS_CADENCE_N: "99" }),
+      projectDir,
+    );
+    assert.equal(result.exitCode, 0);
+    const parsed = JSON.parse(result.stdout.trim()) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    assert.deepEqual(parsed, {
+      hookSpecificOutput: {
+        hookEventName: "PostToolUseFailure",
+        additionalContext: "The Claude Bash command previously exited with code 1.",
+      },
+    });
+    const db = new DatabaseSync(dbPath());
+    try {
+      const metric = db.prepare("SELECT harness, emitted_reminder FROM effectiveness_metric WHERE session_id = 's1' AND step = 1").get() as
+        | { harness: string; emitted_reminder: number }
+        | undefined;
+      assert.deepEqual({ ...metric }, { harness: "claude", emitted_reminder: 1 });
+    } finally {
+      db.close();
+    }
   });
 
   test("PreCompact never emits additionalContext even in live mode", async () => {

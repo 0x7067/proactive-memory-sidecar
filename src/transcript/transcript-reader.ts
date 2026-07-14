@@ -33,6 +33,8 @@ function condenseContent(content: unknown): string {
     const type = typeof block.type === "string" ? block.type : undefined;
     switch (type) {
       case "text":
+      case "input_text":
+      case "output_text":
         if (typeof block.text === "string") parts.push(block.text);
         break;
       case "thinking":
@@ -42,20 +44,14 @@ function condenseContent(content: unknown): string {
         break;
       case "tool_use": {
         const name = typeof block.name === "string" ? block.name : "unknown_tool";
-        let inputPreview = "";
-        try {
-          inputPreview = JSON.stringify(block.input ?? {});
-        } catch {
-          inputPreview = "{}";
-        }
-        parts.push(`[tool_use ${name} input=${truncate(inputPreview, 200)}]`);
+        // Tool arguments can contain commands, credentials, and provider data.
+        // The provider prompt only needs the structural fact that a tool ran.
+        parts.push(`[tool_use ${name}]`);
         break;
       }
       case "tool_result": {
-        const inner = "content" in block ? block.content : block;
-        const preview = typeof inner === "string" ? inner : condenseContent(inner);
         const isError = block.is_error === true;
-        parts.push(`[tool_result${isError ? " (error)" : ""} ${truncate(preview, 300)}]`);
+        parts.push(`[tool_result${isError ? " (error)" : ""}]`);
         break;
       }
       case "image":
@@ -78,13 +74,25 @@ function normalizeRole(role: unknown): TranscriptRole {
  * line does not represent a conversational turn (summaries, snapshots,
  * meta records, or anything unrecognized).
  *
- * Handles both the nested Claude Code transcript shape
+ * Handles the nested Claude Code transcript shape
  * (`{ type: "user"|"assistant", message: { role, content } }`) and a
- * flattened `{ role, content }` shape defensively, since the exact
+ * flattened `{ role, content }` shape, plus Codex rollout message records
+ * (`{ type: "response_item", payload: { type: "message", role, content } }`).
+ * Codex tool-call and tool-output response items are intentionally skipped:
+ * their raw arguments/output have already crossed a tool boundary and are not
+ * needed in a provider prompt. The exact
  * internal transcript format is not a documented, versioned contract.
  */
 function normalizeLine(parsed: unknown): TranscriptMessage | null {
   if (!isRecord(parsed)) return null;
+
+  if (parsed.type === "response_item") {
+    if (!isRecord(parsed.payload) || parsed.payload.type !== "message") return null;
+    if (parsed.payload.role !== "user" && parsed.payload.role !== "assistant") return null;
+    const text = condenseContent(parsed.payload.content).trim();
+    if (text === "") return null;
+    return { role: parsed.payload.role, text: truncate(text, MAX_MESSAGE_CHARS) };
+  }
 
   // Nested shape: { type: "user" | "assistant", message: { role, content } }
   const outerType = typeof parsed.type === "string" ? parsed.type : undefined;

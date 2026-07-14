@@ -21,6 +21,10 @@ export function isNearDuplicateToolCall(
   const recent = getRecentToolCalls(db, sessionId, toolName, window);
   for (const call of recent) {
     if (!call.input_sig) continue;
+    if (inputSig.startsWith("sha256:") && call.input_sig.startsWith("sha256:")) {
+      if (inputSig === call.input_sig) return true;
+      continue;
+    }
     if (trigramSimilarity(inputSig, call.input_sig) > threshold) return true;
   }
   return false;

@@ -1,10 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Config } from "../config.js";
 import { withTransaction } from "../db/transaction.js";
-import { canonicalizeToolInput } from "../lib/canonicalize.js";
 import { debugLog, describeError } from "../lib/debug-log.js";
 import type { Deadline } from "../lib/deadline.js";
 import { isRecord } from "../lib/type-guards.js";
+import { preflightProviderEgress } from "../privacy/provider-egress.js";
 import {
   applyBankOps,
   getEntriesByIds,
@@ -20,6 +20,7 @@ import {
 } from "../store/session-progress-store.js";
 import { getOrCreateSession, getSession, incrementStep } from "../store/session-store.js";
 import { recordBankOpLog } from "../store/bank-op-log-store.js";
+import { recordEffectivenessMetric } from "../store/effectiveness-metric-store.js";
 import { finalizeTriggerEvent, recordTriggerEvent } from "../store/trigger-event-store.js";
 import { isNearDuplicateToolCall } from "../trigger/near-duplicate.js";
 import { decideTrigger } from "../trigger/trigger-policy.js";
@@ -35,7 +36,7 @@ import type {
 } from "../types.js";
 import { evaluateReminderGuards, type GuardContext, type ReminderCandidate } from "./guards.js";
 import { parseModelResponse } from "./parser.js";
-import { buildPrompt, type PromptToolEvent } from "./prompt.js";
+import { buildPrompt } from "./prompt.js";
 
 export interface EngineDeps {
   db: DatabaseSync;
@@ -51,26 +52,8 @@ export interface EngineDeps {
    * `config.model.timeoutMs` unclamped.
    */
   deadline?: Deadline;
-}
-
-function extractToolEvent(payload: HookPayload): PromptToolEvent {
-  if (payload.hook_event_name === "PostToolUse") {
-    return {
-      toolName: payload.tool_name,
-      toolInput: payload.tool_input ?? null,
-      toolResponse: payload.tool_response ?? null,
-      error: payload.error ?? null,
-    };
-  }
-  if (payload.hook_event_name === "PostToolUseFailure") {
-    return {
-      toolName: payload.tool_name,
-      toolInput: payload.tool_input ?? null,
-      toolResponse: null,
-      error: payload.error ?? null,
-    };
-  }
-  return { toolName: null, toolInput: null, toolResponse: null, error: null };
+  /** Injectable only so privacy tests can prove prompt construction never ran. */
+  promptBuilder?: typeof buildPrompt;
 }
 
 /**
@@ -83,6 +66,9 @@ function recordFastPathSilence(
   step: number,
   latencyMs: number,
   shadow: boolean,
+  payload: HookPayload,
+  triggerReason: ReturnType<typeof decideTrigger>["reason"],
+  createdAt: number,
 ): void {
   try {
     withTransaction(db, () => {
@@ -101,6 +87,25 @@ function recordFastPathSilence(
         tokensIn: null,
         tokensOut: null,
         shadow,
+      });
+      recordEffectivenessMetric(db, {
+        sessionId,
+        step,
+        harness: payload.harness,
+        triggerReason,
+        skipReason: "not_triggered",
+        providerOutcome: "not_called",
+        parserOutcome: "not_run",
+        guardOutcome: "not_run",
+        bankOperation: "none",
+        bankOpsTotal: 0,
+        bankOpsApplied: 0,
+        bankOpsRejected: 0,
+        emittedReminder: false,
+        latencyMs,
+        tokensIn: null,
+        tokensOut: null,
+        createdAt,
       });
     });
   } catch {
@@ -137,16 +142,21 @@ function safeFallbackSilence(
   step: number,
   latencyMs: number,
   shadow: boolean,
-  errorMessage: string,
+  _errorMessage: string,
   tokensIn: number | null,
   tokensOut: number | null,
+  payload: HookPayload,
+  triggerReason: ReturnType<typeof decideTrigger>["reason"],
+  providerOutcome: "error" | "not_called",
+  skipReason: "deadline" | "engine_error" | "provider_error",
+  createdAt: number,
 ): void {
   try {
     withTransaction(db, () => {
       finalizeTriggerEvent(db, sessionId, step, {
         phase2Ran: false,
         phase2Outcome: "not_applicable",
-        error: errorMessage.slice(0, 500),
+        error: skipReason,
       });
       recordInterventionLog(db, {
         sessionId,
@@ -158,6 +168,25 @@ function safeFallbackSilence(
         tokensIn,
         tokensOut,
         shadow,
+      });
+      recordEffectivenessMetric(db, {
+        sessionId,
+        step,
+        harness: payload.harness,
+        triggerReason,
+        skipReason,
+        providerOutcome,
+        parserOutcome: "not_run",
+        guardOutcome: "not_run",
+        bankOperation: "none",
+        bankOpsTotal: 0,
+        bankOpsApplied: 0,
+        bankOpsRejected: 0,
+        emittedReminder: false,
+        latencyMs,
+        tokensIn,
+        tokensOut,
+        createdAt,
       });
     });
   } catch {
@@ -180,8 +209,12 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
   const sessionId = payload.session_id;
   const startMs = now();
 
-  const toolEvent = extractToolEvent(payload);
-  const toolInputSig = toolEvent.toolName ? canonicalizeToolInput(toolEvent.toolInput) : null;
+  // This is deliberately the first content-dependent operation. It produces
+  // only a minimal structured summary and a digest; raw command/input/response
+  // values never enter prompt construction or persistence.
+  const egress = preflightProviderEgress(payload);
+  const toolEvent = egress.summary;
+  const toolInputSig = egress.inputFingerprint;
 
   let newStep: number;
   let triggerDecision: ReturnType<typeof decideTrigger>;
@@ -249,8 +282,63 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
 
   const shadow = config.mode === "shadow";
 
+  if (egress.decision !== "allow") {
+    try {
+      withTransaction(db, () => {
+        finalizeTriggerEvent(db, sessionId, newStep, {
+          phase2Ran: false,
+          phase2Outcome: `skipped:${egress.skipReason}`,
+          error: null,
+        });
+        recordInterventionLog(db, {
+          sessionId,
+          step: newStep,
+          decision: "silence",
+          reminder: null,
+          entryIds: null,
+          latencyMs: Math.max(0, now() - startMs),
+          tokensIn: null,
+          tokensOut: null,
+          shadow,
+        });
+        recordEffectivenessMetric(db, {
+          sessionId,
+          step: newStep,
+          harness: payload.harness,
+          triggerReason: triggerDecision.reason,
+          skipReason: egress.skipReason,
+          providerOutcome: "not_called",
+          parserOutcome: "not_run",
+          guardOutcome: "not_run",
+          bankOperation: "none",
+          bankOpsTotal: 0,
+          bankOpsApplied: 0,
+          bankOpsRejected: 0,
+          emittedReminder: false,
+          latencyMs: Math.max(0, now() - startMs),
+          tokensIn: null,
+          tokensOut: null,
+          createdAt: startMs,
+        });
+      });
+    } catch {
+      // The privacy decision still holds even if its content-free metric row
+      // cannot be persisted: fail open to the action agent and stay silent.
+    }
+    return { stdoutJson: null };
+  }
+
   if (!triggerDecision.triggered) {
-    recordFastPathSilence(db, sessionId, newStep, Math.max(0, now() - startMs), shadow);
+    recordFastPathSilence(
+      db,
+      sessionId,
+      newStep,
+      Math.max(0, now() - startMs),
+      shadow,
+      payload,
+      triggerDecision.reason,
+      startMs,
+    );
     return { stdoutJson: null };
   }
 
@@ -283,7 +371,7 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       const liveEntries = listLiveEntries(db, sessionId);
       const transcriptTail = readTranscriptTail(payload.transcript_path, config.transcriptTailK);
 
-      const { system, user } = buildPrompt({
+      const { system, user } = (deps.promptBuilder ?? buildPrompt)({
         hookEvent,
         step: newStep,
         cadenceN: config.cadenceN,
@@ -325,6 +413,11 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       modelError,
       tokensIn,
       tokensOut,
+      payload,
+      triggerDecision.reason,
+      remainingForModel <= 0 ? "not_called" : "error",
+      remainingForModel <= 0 ? "deadline" : "provider_error",
+      startMs,
     );
     return { stdoutJson: null };
   }
@@ -361,7 +454,8 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       // spend, since the model call genuinely happened.
       const progress = getSessionProgress(db, sessionId);
       if (newStep < progress.committedStep) {
-        recordBankOpLog(db, sessionId, newStep, staleOpResults(parsed.opEntries), appliedAt);
+        const staleResults = staleOpResults(parsed.opEntries);
+        recordBankOpLog(db, sessionId, newStep, staleResults, appliedAt);
 
         finalizeTriggerEvent(db, sessionId, newStep, {
           phase2Ran: false,
@@ -380,6 +474,25 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
           tokensOut,
           shadow,
         });
+        recordEffectivenessMetric(db, {
+          sessionId,
+          step: newStep,
+          harness: payload.harness,
+          triggerReason: triggerDecision.reason,
+          skipReason: "stale_superseded",
+          providerOutcome: "success",
+          parserOutcome: parsed.parseError === null ? "accepted" : "rejected",
+          guardOutcome: "not_run",
+          bankOperation: staleResults.length === 0 ? "none" : "rejected",
+          bankOpsTotal: staleResults.length,
+          bankOpsApplied: 0,
+          bankOpsRejected: staleResults.length,
+          emittedReminder: false,
+          latencyMs: Math.max(0, now() - startMs),
+          tokensIn,
+          tokensOut,
+          createdAt: startMs,
+        });
 
         const staleDecision: InterventionDecision = "silence";
         const staleReminder: string | null = null;
@@ -394,6 +507,7 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       let phase2Outcome: Phase2Outcome;
       let finalReminder: string | null = null;
       let finalEntryIds: string[] | null = null;
+      let guardOutcome = "not_run";
 
       if (!triggerDecision.phase2Eligible) {
         // PreCompact: mechanically forced to silence regardless of what the
@@ -431,10 +545,12 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
 
         const evaluation = evaluateReminderGuards(candidate, guardCtx);
         if (evaluation.accepted) {
+          guardOutcome = "accepted";
           phase2Outcome = "accepted";
           finalReminder = evaluation.text;
           finalEntryIds = evaluation.groundingIds;
         } else {
+          guardOutcome = `rejected:${evaluation.failure.guard}`;
           phase2Outcome = `rejected:${evaluation.failure.guard}`;
           debugLog(config, "reminder rejected by guard", evaluation.failure);
         }
@@ -464,6 +580,46 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
         shadow,
       });
 
+      const appliedCount = appliedResults.filter((result) => result.applied).length;
+      const rejectedCount = appliedResults.length - appliedCount;
+      const bankOperation = appliedResults.length === 0
+        ? "none"
+        : appliedCount === appliedResults.length
+          ? "applied"
+          : appliedCount === 0
+            ? "rejected"
+            : "mixed";
+      const skipReason = !triggerDecision.phase2Eligible
+        ? "precompact"
+        : parsed.phase2.kind === "no_intervention"
+          ? "no_intervention"
+          : parsed.phase2.kind === "unparseable"
+            ? "parser_rejection"
+            : finalReminder === null
+              ? "guard_rejection"
+              : shadow
+                ? "shadow"
+                : "none";
+      recordEffectivenessMetric(db, {
+        sessionId,
+        step: newStep,
+        harness: payload.harness,
+        triggerReason: triggerDecision.reason,
+        skipReason,
+        providerOutcome: "success",
+        parserOutcome: parsed.parseError === null ? "accepted" : "rejected",
+        guardOutcome,
+        bankOperation,
+        bankOpsTotal: appliedResults.length,
+        bankOpsApplied: appliedCount,
+        bankOpsRejected: rejectedCount,
+        emittedReminder: finalReminder !== null && !shadow,
+        latencyMs: Math.max(0, now() - startMs),
+        tokensIn,
+        tokensOut,
+        createdAt: startMs,
+      });
+
       return { finalDecision, finalReminder };
     });
 
@@ -488,6 +644,11 @@ export async function processHookEvent(payload: HookPayload, deps: EngineDeps): 
       describeError(err),
       tokensIn,
       tokensOut,
+      payload,
+      triggerDecision.reason,
+      "error",
+      "engine_error",
+      startMs,
     );
     return { stdoutJson: null };
   }

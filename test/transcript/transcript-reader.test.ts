@@ -88,8 +88,38 @@ describe("transcript-reader", () => {
     assert.equal(messages.length, 2);
     assert.match(messages[0]?.text ?? "", /\[thinking\]/);
     assert.match(messages[0]?.text ?? "", /I'll run a command\./);
-    assert.match(messages[0]?.text ?? "", /\[tool_use Bash input=\{"command":"ls -la"\}\]/);
-    assert.match(messages[1]?.text ?? "", /\[tool_result .*total 0/);
+    assert.match(messages[0]?.text ?? "", /\[tool_use Bash\]/);
+    assert.match(messages[1]?.text ?? "", /\[tool_result\]/);
+    assert.doesNotMatch(messages.map((message) => message.text).join("\n"), /ls -la|total 0/);
+  });
+
+  test("Codex response_item messages populate the recent trajectory without tool arguments", () => {
+    const path = writeFixture("codex-rollout.jsonl", [
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "keep the hooks disabled" }],
+        },
+      },
+      {
+        type: "response_item",
+        payload: { type: "custom_tool_call", name: "Bash", input: "railway TOKEN=do-not-leak" },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "the hook remains disabled" }],
+        },
+      },
+    ]);
+    assert.deepEqual(readTranscriptTail(path, 8), [
+      { role: "user", text: "keep the hooks disabled" },
+      { role: "assistant", text: "the hook remains disabled" },
+    ]);
   });
 
   test("non-turn lines (summary/system/file-history-snapshot) are skipped", () => {

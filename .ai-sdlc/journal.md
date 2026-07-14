@@ -15,3 +15,15 @@
   Claude used 34 calls and 48,711 input tokens for 10 reminders.
 - Decided: fix privacy and effectiveness in this standalone repo, keep hooks off
   until the new tests and gates pass, and do not reintroduce agentctl for now.
+
+## 2026-07-14 — Standalone privacy and effectiveness remediation
+- Did: added a pre-prompt provider-egress classifier, content-minimized event
+  summaries, content-free funnel metrics, project-local secure storage, Codex
+  rollout trajectory support, per-harness gates, and standalone hook templates.
+- Diagnosed: Codex's 47 valid `no_intervention` responses lacked recent
+  trajectory because `response_item` messages were ignored; cadence is unchanged.
+- Verified: `npm run verify` passes 308 tests in 43 suites. Denied and ambiguous
+  commands build no prompt, call no adapter, and persist no raw command/secret;
+  both harness wire tests and the no-provider fake benchmark pass.
+- Decided: keep home hooks disabled and Codex unrecommended; any future canary
+  must be explicitly approved, project-scoped, and reversible.

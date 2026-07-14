@@ -125,6 +125,37 @@ CREATE TABLE IF NOT EXISTS session_progress (
 `;
 
 /**
+ * Version 3: one content-free effectiveness row per processed step. Every
+ * value is categorical or numeric; raw commands, prompts, provider text,
+ * reminder text, bank content, paths, and secrets have no column here.
+ */
+const EFFECTIVENESS_METRIC_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS effectiveness_metric (
+  session_id          TEXT NOT NULL,
+  step                INTEGER NOT NULL,
+  harness             TEXT NOT NULL CHECK (harness IN ('claude','codex','unknown')),
+  trigger_reason      TEXT NOT NULL,
+  skip_reason         TEXT NOT NULL,
+  provider_outcome    TEXT NOT NULL,
+  parser_outcome      TEXT NOT NULL,
+  guard_outcome       TEXT NOT NULL,
+  bank_operation      TEXT NOT NULL,
+  bank_ops_total      INTEGER NOT NULL DEFAULT 0,
+  bank_ops_applied    INTEGER NOT NULL DEFAULT 0,
+  bank_ops_rejected   INTEGER NOT NULL DEFAULT 0,
+  emitted_reminder    INTEGER NOT NULL DEFAULT 0 CHECK (emitted_reminder IN (0,1)),
+  latency_ms          INTEGER NOT NULL,
+  tokens_in           INTEGER,
+  tokens_out          INTEGER,
+  created_at          INTEGER NOT NULL,
+  PRIMARY KEY (session_id, step)
+);
+
+CREATE INDEX IF NOT EXISTS idx_effectiveness_harness
+  ON effectiveness_metric(harness, provider_outcome, emitted_reminder);
+`;
+
+/**
  * Idempotent schema initialization + forward-only migration runner, gated
  * on `PRAGMA user_version`. Safe to call on every connection open: a
  * database already at `SCHEMA_VERSION` does no writes beyond the pragma
@@ -150,6 +181,17 @@ export function initializeSchema(db: DatabaseSync): void {
     }
     if (currentVersion < 2) {
       db.exec(SESSION_PROGRESS_SCHEMA_SQL);
+    }
+    if (currentVersion < 3) {
+      db.exec(EFFECTIVENESS_METRIC_SCHEMA_SQL);
+      // Privacy-boundary migration: v1/v2 could store raw tool input in
+      // input_sig and prompt-bearing content in status/bank/reminder fields.
+      // The memory is session-ephemeral, so clear legacy content once rather
+      // than risk sending it through the stricter v3 provider path.
+      db.exec("UPDATE session SET status = ''");
+      db.exec("DELETE FROM entry");
+      db.exec("UPDATE intervention_log SET reminder = NULL, entry_ids = NULL");
+      db.exec("UPDATE trigger_event SET input_sig = NULL, error = NULL");
     }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");

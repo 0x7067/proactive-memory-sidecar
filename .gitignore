@@ -9,7 +9,7 @@ npm-debug.log*
 *.sqlite3-wal
 *.sqlite3-shm
 *.sqlite3-journal
-.claude/pms/
+.proactive-memory/
 
 # OS / editor cruft
 .DS_Store

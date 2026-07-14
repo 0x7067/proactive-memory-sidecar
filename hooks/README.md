@@ -1,178 +1,144 @@
-# Installing the hook
+# Standalone installation and hook attachment
 
-This sidecar attaches to three Claude Code hook events: **PostToolUse**,
-**PostToolUseFailure**, and **PreCompact**. All three run the same compiled
-CLI (`dist/src/bin/hook.js`); it inspects `hook_event_name` on stdin and
-dispatches internally — you register the same command three times.
+This repository is the complete installation and deployment boundary. The
+hook command must point directly to this checkout's compiled CLI. Do not route
+it through agentctl or any other installer, wrapper, generated configuration,
+or deployment layer.
 
-## 1. Build the sidecar
+The examples do not modify `~/.claude` or `~/.codex`. Copy or merge them only
+after the privacy checks and the relevant harness effectiveness gate pass.
 
-From the sidecar's own checkout:
+## 1. Build and verify the fixed checkout
 
-```bash
-npm install
-npm run build
-```
-
-This produces `dist/src/bin/hook.js` (the hook entry point) and
-`dist/src/bin/maintain.js` (the retention/pruning CLI — see the main
-README's "Privacy and data lifecycle" section).
-
-## 2. Reference it from the target project's Claude Code settings
-
-Pick **one** of the following, depending on how you deployed the sidecar
-relative to the project you want it active in.
-
-### Option A — installed as a local dependency (recommended)
+Use a stable absolute path. Moving or deleting the checkout breaks the hook
+command but still fails open.
 
 ```bash
-cd /path/to/your/project
-npm install --save-dev /path/to/proactive-memory-sidecar   # local path or git URL
+cd /absolute/path/to/proactive-memory-sidecar
+npm ci
+npm run verify
 ```
 
-Then in `.claude/settings.json` (project-scoped, committable) or
-`.claude/settings.local.json` (personal, gitignored):
+The build creates:
 
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      { "matcher": "*", "hooks": [
-        { "type": "command", "command": "node",
-          "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 17 }
-      ]}
-    ],
-    "PostToolUseFailure": [
-      { "matcher": "*", "hooks": [
-        { "type": "command", "command": "node",
-          "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 17 }
-      ]}
-    ],
-    "PreCompact": [
-      { "hooks": [
-        { "type": "command", "command": "node",
-          "args": ["${CLAUDE_PROJECT_DIR}/node_modules/proactive-memory-sidecar/dist/src/bin/hook.js"],
-          "timeout": 17 }
-      ]}
-    ]
-  }
-}
+- `dist/src/bin/hook.js`: the synchronous hook entry point.
+- `dist/src/bin/maintain.js`: the retention CLI.
+
+No runtime package or service is installed elsewhere.
+
+## 2. Keep storage project-local
+
+The default database is
+`<hook payload cwd>/.proactive-memory/bank.sqlite3`. The sidecar sets the
+database directory to mode `700` and the database file to mode `600` whenever
+it opens the database. Add this to each target project's `.gitignore`:
+
+```gitignore
+.proactive-memory/
 ```
 
-This exact block is also in [`settings.example.json`](./settings.example.json)
-next to this file — copy/merge it in.
+Do not set `PMS_DB_PATH` to a machine-global agent state directory. Use
+`PMS_DB_PATH` or `PMS_DB_RELATIVE_PATH` only when an operator deliberately
+chooses another project-local or tighter location.
 
-### Option B — a single fixed checkout, shared across projects
+## 3. Prepare project-scoped hook configuration
 
-Skip the `npm install` above and point `args` at the sidecar's absolute
-`dist/src/bin/hook.js` path directly, e.g.
-`"args": ["/home/you/tools/proactive-memory-sidecar/dist/src/bin/hook.js"]`.
-Put this in `~/.claude/settings.json` to enable it for every project on the
-machine, or in one project's `.claude/settings.local.json` to scope it to
-that project only.
+### Claude Code
 
-### Option C — global npm install
+Merge [`settings.example.json`](./settings.example.json) into the target
+project's `.claude/settings.local.json` or `.claude/settings.json`. Replace
+`/absolute/path/to/proactive-memory-sidecar` with the fixed checkout path.
+
+Claude registers `PostToolUse`, `PostToolUseFailure`, and `PreCompact`.
+
+### Codex
+
+Copy [`codex.hooks.example.json`](./codex.hooks.example.json) to the target
+project's `.codex/hooks.json` and replace the same absolute-path placeholder.
+Codex registers `PostToolUse` and `PreCompact`; failed supported tool calls
+arrive as `PostToolUse` with a failed response. Review and trust the project
+hook through Codex's `/hooks` interface before expecting it to run.
+
+Both harnesses receive the same stdout contract. Claude failures preserve
+`hookEventName: "PostToolUseFailure"`; Codex failures preserve
+`hookEventName: "PostToolUse"`.
+
+## 4. Configure the provider explicitly
+
+Set credentials in the hook process environment, not in a committed hook JSON
+file:
 
 ```bash
-npm install -g /path/to/proactive-memory-sidecar
+export PMS_MODEL_PROVIDER=anthropic
+export PMS_MODEL_API_KEY=...
+export PMS_MODEL_NAME=claude-haiku-4-5
 ```
 
-This puts `pms-hook` and `pms-maintain` on `PATH`. Reference the bare
-command instead of `node <path>`:
+The sidecar calls only the configured model endpoint. Shadow mode still calls
+that endpoint and still performs external data processing. It changes only
+whether an accepted reminder is emitted to the action agent.
 
-```json
-{ "type": "command", "command": "pms-hook", "timeout": 17 }
-```
+## 5. Re-enable proposal and rollback
 
-## Codex CLI attachment
-
-Codex uses `.codex/hooks.json`, not Claude settings. Copy
-[`codex.hooks.example.json`](./codex.hooks.example.json) into the target
-project's `.codex/hooks.json`, replace its absolute path placeholder, and set:
+Do not use the fake-adapter benchmark as authorization for provider traffic.
+It proves the pipeline and gate calculation without network access:
 
 ```bash
-export PMS_DB_RELATIVE_PATH=.codex/pms/bank.sqlite3
+npm run benchmark:fake
 ```
 
-The Codex template registers only `PostToolUse` and `PreCompact`: Codex sends
-failed supported tool executions as `PostToolUse` with a failed response, and
-the sidecar normalizes `exit_code` / `exitCode`, `success: false`, and
-`is_error: true` into its existing forced-failure trigger. Its output still
-uses `hookEventName: "PostToolUse"`, as required by Codex. Review and trust
-the command hook through Codex's `/hooks` interface before it runs.
+A reversible rollout is:
 
-## 3. Configure the model adapter
+1. Keep the current hook files backed up.
+2. Obtain approval for the documented provider-bound fields and a bounded
+   shadow canary.
+3. Attach one harness in one project with `PMS_MODE=shadow`.
+4. Query `effectiveness_metric` for that harness, joining
+   `intervention_log` by `(session_id, step)` to count accepted shadow
+   reminders. Require zero provider calls on privacy skips and enough accepted
+   reminders to pass every gate in `src/effectiveness/gate.ts`.
+5. Change only that harness to `PMS_MODE=live` after its real-provider sample
+   passes.
+6. Roll back by restoring the backed-up hook file or setting `PMS_ENABLED=0`.
 
-The hook makes at most one model call per triggered step, and none at all
-on the (common) fast path. Set the following as real environment variables
-available to the hook process (shell profile, `direnv`, a `SessionStart`
-hook writing to `CLAUDE_ENV_FILE`, or your process manager) — **not** in
-`.claude/settings.json`, which is not a secret store and may be committed:
+The recorded Claude sample (34 model calls, 48,711 input tokens, 10 reminders)
+clears the current yield/token/latency thresholds, subject to a new privacy-safe
+canary. The recorded Codex sample (47 calls, 63,351 input tokens, zero
+reminders) fails. Do not recommend or perform a Codex re-enable until a new,
+consented sample with the fixed transcript path produces measured reminders
+and passes the Codex gate.
+
+## Privacy behavior during rollout
+
+Before prompt construction, the sidecar classifies the current tool event.
+Known external-service, network, credential, database, infrastructure,
+browser, and messaging operations produce silence and zero provider requests.
+An event outside the conservative grammar is ambiguous and gets the same
+treatment. The action agent continues normally in every case.
+
+The Bash classifier follows environment assignments, absolute paths, `env`,
+`sudo`, `command`, nested `bash`/`sh`/`zsh -c`, pipelines, compound commands,
+command substitutions, and executable subcommands. Local Git operations may
+proceed to the trigger policy; networked Git operations do not.
+
+## Retention
+
+Rows remain until an operator prunes them. Preview the default 30-day policy,
+then apply it deliberately:
 
 ```bash
-export PMS_MODEL_PROVIDER=anthropic          # or "openai" (any OpenAI-compatible endpoint)
-export PMS_MODEL_API_KEY=sk-...              # falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY
-export PMS_MODEL_NAME=claude-haiku-4-5       # pick a small/fast/cheap model — see README
+node /absolute/path/to/proactive-memory-sidecar/dist/src/bin/maintain.js \
+  --cwd /path/to/project --older-than-days 30 --dry-run
+node /absolute/path/to/proactive-memory-sidecar/dist/src/bin/maintain.js \
+  --cwd /path/to/project --older-than-days 30 --vacuum
 ```
 
-Until this is set, the hook fails open on every triggered step (no API key
-→ no call → silence), which is safe but inert. See the main
-[README](../README.md#model-configuration) for the full variable list.
+Nothing in this repository schedules retention automatically.
 
-## 4. Roll out in shadow mode first
+## Timing and fail-open behavior
 
-By default `PMS_MODE=shadow`: every decision is fully computed and logged
-to the project-local SQLite database, but `additionalContext` is never
-emitted, so the action agent's behavior is completely unaffected. Use a
-few real sessions to inspect `intervention_log` (see the main README's
-"Metrics and queries" section) before setting `PMS_MODE=live`.
-
-## Sync behavior, timeout, and fail-open design
-
-- **Sync, not async.** These hooks are registered as ordinary blocking
-  command hooks, not `"async": true`. A reminder is only useful if it lands
-  *before* the action agent's next decision — the tool result immediately
-  following the triggering event. An async hook's output is only delivered
-  on the *next* turn (per the Claude Code hooks reference), which would be
-  one tool call too late for this use case. The cost is that a triggered
-  step adds real latency (bounded — see below) to that one tool call; a
-  non-triggered step (~most calls, since cadence defaults to every 4th
-  call) adds negligible latency because no model call happens at all.
-- **`timeout: 17`** (seconds — Claude Code's hook `timeout` field is in
-  seconds, not milliseconds) gives a small (2s) cleanup margin above the
-  sidecar's own internal ceiling: the *entire* invocation — stdin read,
-  SQLite open/contention, and the model call together, not just the model
-  call in isolation — is bounded by one deadline capped at 15s
-  (`PMS_OVERALL_TIMEOUT_MS`, hard-capped at `HARD_OVERALL_TIMEOUT_MS`; see
-  [the main README's "Time budget"](../README.md#time-budget)). The
-  sidecar is designed to time out *itself* well before Claude Code's
-  external hook timeout would ever fire, so that it can still write a
-  `silence` audit row and exit 0 cleanly instead of being killed
-  mid-write. 2 seconds is deliberately small, not generous padding:
-  process teardown (closing the SQLite handle, flushing stdout) is
-  expected to take low milliseconds, so this margin exists only to absorb
-  scheduling jitter, not to hide a slower design. If you lower
-  `PMS_OVERALL_TIMEOUT_MS`, you can safely lower this `timeout` field too;
-  just keep a couple of seconds of margin above it. One caveat carries
-  over from the main README unchanged: a truly stuck *synchronous*
-  filesystem call cannot be preempted by the sidecar's own deadline logic
-  either — see [the main README's "Time budget"](../README.md#time-budget)
-  and limitation D8 there.
-- **Fail-open, unconditionally.** Every error path — malformed stdin, an
-  unreachable/erroring/slow model endpoint, a locked SQLite database, a
-  bug in the sidecar itself — results in exit code `0` and empty stdout.
-  Claude Code treats that identically to "this hook had nothing to say":
-  the action agent is never blocked, never shown an error, and never even
-  aware the sidecar exists. See the main README's "Fail-open design" and
-  "Limitations" sections for the exact guarantees and their edges.
-
-## Kill switch
-
-Set `PMS_ENABLED=0` (or `false`) in the hook's environment to make every
-invocation an immediate no-op (no stdin read past the check, no database
-touched, exit 0). This is the fastest way to disable the sidecar without
-editing `.claude/settings.json`. Claude Code's own `"disableAllHooks": true`
-setting is a coarser alternative that also disables any other hooks you
-have configured.
+The templates use a 17-second harness timeout around the sidecar's one
+hard-capped 15-second invocation deadline. Hooks stay synchronous because
+context must arrive before the action agent's next decision. Every failure,
+timeout, denied event, or ambiguous event exits `0`; stdout contains one valid
+hook response or nothing.

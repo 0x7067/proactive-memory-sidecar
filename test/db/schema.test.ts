@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { SCHEMA_VERSION } from "../../src/constants.js";
@@ -129,6 +129,12 @@ describe("db schema + WAL", () => {
     assert.ok(names.includes("trigger_event"));
     assert.ok(names.includes("bank_op_log"));
     assert.ok(names.includes("session_progress"));
+    assert.ok(names.includes("effectiveness_metric"));
+  });
+
+  test("project-local directory is mode 700 and database file is mode 600", () => {
+    assert.equal(statSync(join(tmp.dir, ".proactive-memory")).mode & 0o777, 0o700);
+    assert.equal(statSync(tmp.dbPath).mode & 0o777, 0o600);
   });
 
   test("session_progress has the expected columns and per-session defaults", () => {
@@ -142,9 +148,58 @@ describe("db schema + WAL", () => {
     const nested = openTempDb();
     try {
       assert.ok(existsSync(nested.dbPath));
-      assert.ok(nested.dbPath.includes(join(".claude", "pms")));
+      assert.ok(nested.dbPath.includes(".proactive-memory"));
     } finally {
       nested.cleanup();
+    }
+  });
+
+  test("schema v3 migration clears legacy raw input signatures", () => {
+    const legacy = openTempDb();
+    try {
+      legacy.db.prepare(
+        `INSERT INTO session (session_id, cwd, status, created_at, updated_at)
+         VALUES ('legacy', '/x', 'legacy-secret-status', 1, 1)`,
+      ).run();
+      legacy.db.prepare(
+        `INSERT INTO entry (id, session_id, kind, content, created_step, updated_step)
+         VALUES ('legacy-entry', 'legacy', 'knowledge', 'legacy-secret-entry', 1, 1)`,
+      ).run();
+      legacy.db.prepare(
+        `INSERT INTO intervention_log
+           (session_id, step, decision, reminder, entry_ids, latency_ms)
+         VALUES ('legacy', 1, 'reminder', 'legacy-secret-reminder', '["legacy-entry"]', 1)`,
+      ).run();
+      legacy.db.prepare(
+        `INSERT INTO trigger_event
+           (session_id, step, hook_event, trigger_reason, tool_name, input_sig, error, created_at)
+         VALUES ('legacy', 1, 'PostToolUse', 'not_due', 'Bash',
+                 'railway TOKEN=legacy-secret', 'legacy-secret-error', 1)`,
+      ).run();
+      legacy.db.exec("PRAGMA user_version = 2");
+      legacy.db.close();
+
+      const migrated = openDatabase(legacy.dbPath, { busyTimeoutMs: 1000 });
+      try {
+        const trigger = migrated.prepare(
+          `SELECT input_sig, error FROM trigger_event WHERE session_id = 'legacy' AND step = 1`,
+        ).get() as { input_sig: string | null; error: string | null };
+        const session = migrated.prepare(
+          `SELECT status FROM session WHERE session_id = 'legacy'`,
+        ).get() as { status: string };
+        const intervention = migrated.prepare(
+          `SELECT reminder, entry_ids FROM intervention_log WHERE session_id = 'legacy' AND step = 1`,
+        ).get() as { reminder: string | null; entry_ids: string | null };
+        assert.deepEqual({ ...trigger }, { input_sig: null, error: null });
+        assert.equal(session.status, "");
+        assert.deepEqual({ ...intervention }, { reminder: null, entry_ids: null });
+        assert.equal((migrated.prepare("SELECT count(*) AS n FROM entry").get() as { n: number }).n, 0);
+        assert.equal((migrated.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      legacy.cleanup();
     }
   });
 });

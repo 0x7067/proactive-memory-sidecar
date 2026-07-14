@@ -1,7 +1,7 @@
 # proactive-memory-sidecar
 
-A local-only, no-external-service **proactive memory sidecar** for Claude
-Code and Codex CLI hooks. It maintains a per-session, project-local SQLite
+A standalone **proactive memory sidecar** for Claude Code and Codex CLI
+hooks. It maintains a per-session, project-local SQLite
 memory bank and selectively injects short, fact-only, bank-grounded reminders
 into the action agent after tool events — or stays silent, which is the common
 case. The action agent remains unmodified; the sidecar only adds optional
@@ -27,6 +27,7 @@ deliberately diverges.
 - [Privacy and data lifecycle](#privacy-and-data-lifecycle)
 - [Shadow rollout](#shadow-rollout)
 - [Metrics and queries](#metrics-and-queries)
+- [Per-harness effectiveness gates](#per-harness-effectiveness-gates)
 - [Wire formats](#wire-formats)
 - [Trigger policy](#trigger-policy)
 - [Mechanical guards](#mechanical-guards-the-reminder-contract)
@@ -54,35 +55,44 @@ Per invocation, in order:
 2. **Subagent check.** If the payload carries an `agent_id` (i.e. this
    event fired inside a subagent call, not the main thread), skip
    entirely — no bookkeeping, no logging.
-3. **Trigger policy.** Decide whether this event is *forced* (tool
+3. **Provider-egress preflight.** Classify the current tool event before
+   prompt construction. Known external/networked operations and ambiguous
+   shell syntax force sidecar silence and zero provider requests while the
+   action agent continues normally. Eligible events become a minimal
+   structured summary; raw command, arguments, output, and errors are not
+   forwarded or persisted.
+4. **Trigger policy.** Decide whether this event is *forced* (tool
    failure, or a near-identical repeat of a recent tool call), a *cadence*
    hit (every `PMS_CADENCE_N`th **successful `PostToolUse`** call, default
    4 — `PostToolUseFailure` and `PreCompact` never count towards this and
    never shift which call lands on the Nth tick), a *PreCompact sweep*
    (always runs, Phase 1 only), or none of the above (the common "fast
    path" — no model call at all).
-4. **Phase 1 — bank maintenance** (only on a trigger). One model call
+5. **Phase 1 — bank maintenance** (only on a trigger). One model call
    returns an ordered list of bank operations
    (`update_status` / `save_knowledge` / `save_procedural` / `delete`),
    applied transactionally with a 60-live-entry cap (configurable).
-5. **Phase 2 — selective intervention** (only on a trigger with Phase 2
+6. **Phase 2 — selective intervention** (only on a trigger with Phase 2
    eligibility — PreCompact never has it). The *same* model response also
    contains either a grounded reminder or an explicit "no intervention"
    decision. The reminder is mechanically validated against six guards
    (below) before it is ever trusted; any violation degrades to silence.
-6. **Log and emit.** Every decision — triggered or not, reminder or
+7. **Log and emit.** Every decision — triggered or not, reminder or
    silence — is written to `intervention_log`. In **live** mode, an
    accepted reminder is printed as
    `{"hookSpecificOutput":{"hookEventName":...,"additionalContext":...}}`.
    In **shadow** mode (the default), it is logged but never printed.
 
 ```
-stdin (hook JSON)  ──▶  trigger policy ──▶ [not triggered] ──▶ log "silence", exit 0
+stdin (hook JSON)  ──▶ egress preflight ──▶ [denied/ambiguous] ──▶ silence, zero provider calls
+                              │ [eligible: structured summary only]
+                              ▼
+                       trigger policy ──▶ [not triggered] ──▶ log "silence", exit 0
                               │
                               ▼ [triggered]
                     build prompt from: current bank state (SQLite)
                                      + last k=8 transcript messages
-                                     + the triggering tool event
+                                     + a content-minimized event summary
                               │
                               ▼
                     one model call ──▶ parse Phase 1 ops + Phase 2 decision
@@ -101,18 +111,18 @@ stdin (hook JSON)  ──▶  trigger policy ──▶ [not triggered] ──▶
 
 ## Install
 
-See **[`hooks/README.md`](hooks/README.md)** for the full walkthrough
-(three install variants, exact `.claude/settings.json` block, and why the
-hooks are registered as synchronous/blocking rather than `async: true`).
+See **[`hooks/README.md`](hooks/README.md)** for the standalone walkthrough,
+exact project-scoped hook blocks, retention, and the reversible rollout gates.
 Short version:
 
 ```bash
 npm install && npm run build              # produces dist/src/bin/hook.js
 ```
 
-then add the block from [`hooks/settings.example.json`](hooks/settings.example.json)
-to your target project's `.claude/settings.json`, pointing `args` at your
-`dist/src/bin/hook.js`.
+Then merge [`hooks/settings.example.json`](hooks/settings.example.json) into a
+target project and replace its absolute-path placeholder. The hook command
+points directly at this checkout. No agentctl installation, wrapper,
+configuration, or deployment layer belongs in this path.
 
 ### Codex CLI
 
@@ -120,14 +130,14 @@ Codex uses the same stdin JSON and `additionalContext` output contract, but
 registers command hooks in `<project>/.codex/hooks.json`. Copy
 [`hooks/codex.hooks.example.json`](hooks/codex.hooks.example.json), replace
 `/absolute/path/to/proactive-memory-sidecar` with this checkout's absolute
-path, and set the sidecar database location for the Codex project layer:
+path. Both harnesses use the same project-local default database:
 
 ```bash
 mkdir -p /path/to/your/project/.codex
 cp /path/to/proactive-memory-sidecar/hooks/codex.hooks.example.json \
   /path/to/your/project/.codex/hooks.json
 # Edit .codex/hooks.json and replace the placeholder absolute path.
-export PMS_DB_RELATIVE_PATH=.codex/pms/bank.sqlite3
+# Default storage: /path/to/your/project/.proactive-memory/bank.sqlite3
 ```
 
 The template attaches to Codex `PostToolUse` and `PreCompact`. Codex reports
@@ -136,6 +146,14 @@ the sidecar recognizes `exit_code` / `exitCode`, `success: false`, and
 `is_error: true` response signals as a forced failure trigger while preserving
 `PostToolUse` in its output. This keeps Codex's hook wire format valid and
 ensures failures do not advance the successful-call cadence counter.
+
+The zero-reminder audit did not fail in the trigger, provider parser, bank-op
+application, guards, or stdout contract. All 47 Codex provider responses
+parsed as `no_intervention`. The defect was prompt construction:
+`transcript-reader.ts` recognized Claude message records but ignored Codex
+rollout `response_item` messages, leaving Codex without its recent trajectory.
+The reader now accepts Codex user/assistant message items while omitting tool
+call arguments and outputs. Cadence remains unchanged.
 
 Codex requires project-local command hooks to be reviewed and trusted. Open
 `/hooks` in Codex to review and trust the copied hook definition before use.
@@ -189,11 +207,11 @@ makes none at all until you do.
 ## Privacy and data lifecycle
 
 - **Project-local, not global.** The database lives at
-  `<project>/.claude/pms/bank.sqlite3` by default (override with
+  `<project>/.proactive-memory/bank.sqlite3` by default (override with
   `PMS_DB_PATH` or `PMS_DB_RELATIVE_PATH`) — one SQLite file per project,
-  never a machine-wide or home-directory store. Add `.claude/pms/` to the
-  project's `.gitignore` (the sidecar's own `.gitignore` already does this
-  for its own repo).
+  never a machine-wide or home-directory store. The sidecar enforces mode
+  `700` on the containing directory and mode `600` on the database whenever
+  it opens it. Add `.proactive-memory/` to the project's `.gitignore`.
 - **Per-session isolation, single shared file.** All sessions for a
   project live in the same database file, isolated by `session_id`
   (composite primary keys throughout). A session's bank is never read by,
@@ -216,11 +234,42 @@ makes none at all until you do.
 
   Wire it to a cron/scheduled task if you want automatic pruning; nothing
   in this repository schedules it for you.
-- **What actually leaves the machine.** Only what you send to your
-  configured model provider: the current bank contents, the last
-  `PMS_TRANSCRIPT_TAIL_K` (default 8) condensed transcript messages, and
-  the single triggering tool event. No telemetry, no analytics, no calls
-  to anything other than the model endpoint you configured.
+- **Provider-egress preflight.** `src/privacy/provider-egress.ts` runs before
+  prompt construction. It follows environment assignments; `env`, `sudo`,
+  `command`, and absolute-path wrappers; nested `bash`/`sh`/`zsh -c`;
+  pipelines and compound commands; command substitutions; and executable
+  subcommands. It denies external-service, network, credential, database,
+  infrastructure, browser, and messaging operations. The deny set includes
+  Railway, GitHub CLI, curl/wget/SSH, Notion, Slack, Linear, PostgreSQL/MySQL,
+  Docker/Kubernetes, AWS/GCP/Azure, and their direct tool equivalents.
+  Ambiguous syntax receives the same privacy result: action-agent execution
+  remains fail-open, the sidecar emits nothing, and no provider request occurs.
+- **Git is classified by operation.** Local operations such as `status`,
+  `diff`, `log`, `add`, and `commit` may reach the trigger policy. `push`,
+  `fetch`, `pull`, `clone`, `ls-remote`, remote operations, credential
+  operations, and submodule network access do not.
+- **Raw tool payloads do not leave or persist.** The prompt receives only
+  `toolName`, `eventKind`, `outcome`, `commandCount`, the executable names,
+  local Git operation names, and four booleans for pipeline, compound-command,
+  nested-shell, and command-substitution presence. Arguments, environment
+  names and values, paths, command text, tool output, and error text are absent.
+  `trigger_event.input_sig` stores only a SHA-256 fingerprint for repeat
+  detection. The schema-v3 migration clears legacy raw signatures, errors,
+  session status, bank entries, and stored reminder text once so an upgraded
+  database cannot resend content captured before this boundary existed.
+- **Every field that may leave the machine.** A provider request contains the
+  selected model name, output-token/timeout settings, the fixed system prompt,
+  and a user prompt containing: hook event, step, cadence, trigger reason,
+  forced/eligibility flags; the structured event fields listed above; session
+  status; bank entry id/kind/content and step/injection metadata; up to
+  `PMS_TRANSCRIPT_TAIL_K` user/assistant message roles and text, each capped at
+  800 characters; bank cap, reminder cap, and cooldown. Provider credentials
+  leave only as the HTTP authentication header. Claude tool arguments/results
+  and Codex tool-call/output rollout records are reduced to structural markers
+  or omitted before prompt construction.
+- **No other egress.** The sidecar sends no telemetry or analytics and calls no
+  endpoint other than the configured model provider. That provider call is
+  external processing even in shadow mode.
 - **No timestamps in what gets remembered.** Bank entries and reminders
   are written to reference the session's own step counter ("at step 14"),
   never wall-clock time — see ["Wire formats"](#wire-formats) and
@@ -230,7 +279,7 @@ makes none at all until you do.
 
 ## Shadow rollout
 
-`PMS_MODE` defaults to `shadow`. In shadow mode the *entire* pipeline
+`PMS_MODE` defaults to `shadow`. Shadow mode is not a privacy mode: the entire pipeline
 runs for real — trigger policy, the model call, Phase 1 bank writes, all
 six Phase 2 guards — and every decision is logged to `intervention_log`
 exactly as it would be live, including the `shadow` flag on each row. The
@@ -238,8 +287,8 @@ only difference is the last step: a `shadow=1` `reminder` decision is
 never printed to stdout, so the action agent's behavior is completely
 unaffected.
 
-This lets you validate the pipeline against your real usage before it can
-influence anything:
+Use it only as a consented effectiveness canary before the sidecar can
+influence the action agent:
 
 ```sql
 -- Reminder rate and shadow/live split for a project's most recent session
@@ -252,7 +301,7 @@ environment variable — the historical shadow log stays as an audit trail.
 
 ## Metrics and queries
 
-All of the following run against `<project>/.claude/pms/bank.sqlite3`
+All of the following run against `<project>/.proactive-memory/bank.sqlite3`
 with any SQLite client (`sqlite3 bank.sqlite3`, DB Browser for SQLite,
 `node -e "require('node:sqlite')..."`, etc.). The database ships with the
 JSON1 extension available (confirmed against the bundled `node:sqlite`
@@ -307,15 +356,69 @@ FROM entry
 WHERE deleted = 0
 GROUP BY session_id
 ORDER BY live_entries DESC;
+
+-- Content-free effectiveness funnel, split by harness
+SELECT harness, trigger_reason, skip_reason, provider_outcome,
+       parser_outcome, guard_outcome, bank_operation,
+       count(*) AS steps, sum(emitted_reminder) AS emitted_reminders,
+       sum(tokens_in) AS input_tokens, avg(latency_ms) AS average_latency_ms
+FROM effectiveness_metric
+GROUP BY harness, trigger_reason, skip_reason, provider_outcome,
+         parser_outcome, guard_outcome, bank_operation;
+
+-- Privacy invariant: this result must be zero for each harness
+SELECT harness, count(*) AS violations
+FROM effectiveness_metric
+WHERE skip_reason LIKE 'egress_%' AND provider_outcome != 'not_called'
+GROUP BY harness;
 ```
 
-`trigger_event`, `bank_op_log`, and `session_progress` are additive tables
+`trigger_event`, `bank_op_log`, `session_progress`, and
+`effectiveness_metric` are additive tables
 beyond the three the design brief mandates verbatim (`session`, `entry`,
 `intervention_log`) — see [`src/db/schema.ts`](src/db/schema.ts) for the
 full DDL and the rationale in its header comment. `session_progress`
 (schema v2) holds the durable cadence counter and concurrency watermark —
 see ["Trigger policy"](#trigger-policy) and ["Concurrency
 model"](#concurrency-model).
+
+`effectiveness_metric` contains categories and numbers only: trigger/skip
+reason, provider/parser/guard outcome, aggregate bank-operation outcome,
+emission flag, token counts, and latency. It has no command, prompt, provider
+response, reminder, path, bank content, or secret column.
+
+For a shadow canary, count accepted reminders by joining the content-bearing
+decision log to the content-free harness metric; `emitted_reminder` correctly
+stays zero in shadow because the hook did not emit context:
+
+```sql
+SELECT em.harness, count(*) AS accepted_shadow_reminders
+FROM effectiveness_metric em
+JOIN intervention_log il USING (session_id, step)
+WHERE il.shadow = 1 AND il.decision = 'reminder'
+GROUP BY em.harness;
+```
+
+## Per-harness effectiveness gates
+
+[`src/effectiveness/gate.ts`](src/effectiveness/gate.ts) evaluates Claude and
+Codex independently. A sample must have zero privacy violations and zero
+provider calls on privacy skips, at least 20 model calls and 3 reminders, a
+reminder rate of at least 10%, no more than 10 calls or 15,000 input tokens per
+reminder, average latency at most 3 seconds, and maximum latency at most 5
+seconds.
+
+The recorded audit gives different results:
+
+| Harness | Model calls | Input tokens | Reminders | Gate result |
+|---|---:|---:|---:|---|
+| Claude | 34 | 48,711 | 10 | Yield/token/latency thresholds pass; repeat a privacy-safe canary before re-enable |
+| Codex | 47 | 63,351 | 0 | Fails; do not recommend re-enable |
+
+`npm run benchmark:fake` exercises both pipelines and gate calculations with a
+local fake adapter. It makes no provider calls and cannot authorize a real
+provider rollout. Codex needs a new, explicitly approved shadow sample with the
+fixed transcript reader before its real-provider gate can pass.
 
 ## Wire formats
 
@@ -403,12 +506,12 @@ all-event chronological step used for every other ordering/audit purpose
 
 **Near-identical repeated calls** are detected against this project's own
 `trigger_event` log (not the transcript file, which Claude Code documents
-as written asynchronously and possibly lagging the event currently
-firing): the current call's canonicalized `tool_input` is compared, via
-character-trigram Jaccard similarity, against the last
-`PMS_NEAR_DUP_WINDOW` (default 5) calls to the *same* tool name in this
-session; a similarity strictly above `PMS_NEAR_DUP_THRESHOLD` (default
-0.85) marks it a forced trigger.
+as written asynchronously and possibly lagging the event currently firing).
+New rows store only a `sha256:` fingerprint. Shell fingerprints collapse
+whitespace before hashing, so exact and whitespace-only retries match without
+persisting command text. Older non-hash signatures are cleared by schema v3;
+the legacy trigram comparison remains only for compatibility with an in-memory
+caller that supplies a non-hash signature.
 
 "Forced" means the trigger fires regardless of cadence, and additionally
 **bypasses the per-entry cooldown guard** (but no other guard) — see next
@@ -468,13 +571,10 @@ both the paper's own example text and deliberately-adversarial inputs.
 ## Model-prompt data boundaries
 
 Every prompt sent to the memory-maintenance model (`src/engine/prompt.ts`)
-mixes trusted template text with untrusted reported data: bank entry
-`content`, `session.status`, transcript messages, and a tool's
-`tool_input`/`tool_response`/`error`. None of that data is written by this
-project — it originates from the action agent's own tool calls and from
-the memory model's own prior responses (which themselves echo tool
-output) — so it is treated as data to describe, never as instructions to
-follow, at two independent layers:
+mixes trusted template text with untrusted bank entry content, session status,
+and user/assistant transcript text. The current tool event has already passed
+the provider-egress preflight and arrives as the content-minimized structure
+listed in ["Privacy and data lifecycle"](#privacy-and-data-lifecycle).
 
 - **Bank entry ids are a constrained slug, not free text.** `id` is
   validated against `^[a-z0-9:_-]+$` at parse time (see ["Wire
@@ -484,16 +584,15 @@ follow, at two independent layers:
   structurally means an id can never itself carry a quote or newline that
   could reshape that future prompt's structure.
 - **Free-text values are rendered as escaped, quoted JSON string
-  literals, not spliced in raw.** Bank `content`, `session.status`,
-  transcript message text, and a tool's `error` message are all passed
+  literals, not spliced in raw.** Bank `content`, `session.status`, and
+  transcript message text are passed
   through `JSON.stringify` before being placed in the prompt
   (`quoteUntrusted()` in `src/engine/prompt.ts`). A value containing a
   newline and a line that looks like `## Current tool event` cannot
   manifest as an actual new prompt section — it stays inside one quoted,
   escaped line. Every relevant prompt section header also says plainly
-  that its contents are untrusted reported data. `tool_input`/
-  `tool_response` (structured, not plain strings) get the equivalent
-  treatment via `safeJson()`, which already predates this change.
+  that its contents are untrusted reported data. Raw tool input, response, and
+  error fields never reach this renderer.
 
 **What this is and isn't.** This is a *structural* boundary: it guarantees
 untrusted text cannot forge fake prompt sections, tags, or delimiters by
@@ -651,8 +750,8 @@ Numbered for reference, not in priority order.
   stateless subprocess with no persistent, in-process view of the action
   agent's actual live context window. Everything the sidecar reasons about
   is re-derived per call from three sources: the SQLite bank, a bounded
-  re-read of the last `k=8` transcript messages, and the single triggering
-  tool event. It cannot see the real system prompt, context injected by
+  re-read of the last `k=8` user/assistant transcript messages, and the
+  triggering event's content-minimized summary. It cannot see the real system prompt, context injected by
   *other* hooks, mid-turn state not yet flushed to the transcript file, or
   confirm that a previously-emitted reminder was actually attended to by
   the model — only that it was logged and (if live) printed. Claude Code's
@@ -665,8 +764,8 @@ Numbered for reference, not in priority order.
   window into the agent's true context — is structural to the hook
   architecture itself, not something a sidecar process can fix.
 - **D2 — Trigger policy is structural, not semantic.** Cadence, forced
-  failure, and near-duplicate detection are syntactic signals (counts,
-  event types, textual similarity), not an understanding of whether a
+  failure, and repeat detection are syntactic signals (counts, event types,
+  and privacy-safe fingerprint equality), not an understanding of whether a
   given moment is actually decision-relevant. This can under-trigger
   (something important happens between cadence ticks) or, in principle,
   over-trigger relative to what the paper's own more expensive
@@ -730,6 +829,14 @@ Numbered for reference, not in priority order.
   rather than left implicit: the 15-second budget is a strong, tested
   guarantee for the overwhelmingly common case (a healthy local
   filesystem), not an absolute one for every pathological environment.
+- **D9 — The egress parser is conservative, not a shell interpreter.** Known
+  external/networked commands are denied mechanically. Syntax outside the
+  bounded grammar becomes ambiguous and suppresses only the sidecar provider
+  request; the action agent still runs. This favors missed memory updates over
+  accidental provider egress. The allow path still sends the documented bank,
+  status, and user/assistant transcript fields to the configured provider, so
+  operators must treat every enabled or shadow invocation as external data
+  processing.
 - **Node.js version.** Requires `node:sqlite`, which shipped experimental
   and flagged in Node 22.5, then unflagged (still experimental-warned) in
   a later Node 22.x — this project was built and tested against Node
@@ -846,6 +953,7 @@ run against compiled output) that any change here must preserve.
 ```bash
 npm install
 npm run verify   # typecheck && lint && build && test
+npm run benchmark:fake  # local fake adapter; validates both harness gates without provider calls
 ```
 
 ## License

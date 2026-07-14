@@ -1,6 +1,6 @@
 import { HANDLED_HOOK_EVENTS } from "./constants.js";
 import { isRecord } from "./lib/type-guards.js";
-import type { CommonHookFields, HandledHookEventName, HookPayload } from "./types.js";
+import type { CommonHookFields, HandledHookEventName, HarnessName, HookPayload } from "./types.js";
 
 export function isHandledHookEvent(name: unknown): name is HandledHookEventName {
   return typeof name === "string" && (HANDLED_HOOK_EVENTS as readonly string[]).includes(name);
@@ -21,6 +21,16 @@ function num(v: unknown): number | undefined {
 
 function bool(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
+}
+
+function inferHarness(raw: Record<string, unknown>): HarnessName {
+  if (typeof raw.turn_id === "string" || typeof raw.model === "string") return "codex";
+  if (typeof raw.transcript_path === "string") {
+    if (raw.transcript_path.includes("/.codex/")) return "codex";
+    if (raw.transcript_path.includes("/.claude/")) return "claude";
+  }
+  if (raw.hook_event_name === "PostToolUseFailure") return "claude";
+  return "unknown";
 }
 
 /**
@@ -64,6 +74,7 @@ export function parseHookPayload(raw: unknown): HookPayload | null {
     agent_type: str(raw.agent_type),
     permission_mode: str(raw.permission_mode),
     prompt_id: str(raw.prompt_id),
+    harness: inferHarness(raw),
   };
 
   if (raw.hook_event_name === "PostToolUse") {

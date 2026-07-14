@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { processHookEvent } from "../../src/engine/engine.js";
 import type { Config } from "../../src/config.js";
@@ -230,7 +232,7 @@ Fix the regex so it only matches single-digit octets.
     assert.equal(trig?.phase2_outcome, "rejected:factual_prose");
   });
 
-  test("model adapter throwing degrades to silence and records the error, without throwing to the caller", async () => {
+  test("model adapter throwing degrades to silence and records a content-free provider outcome", async () => {
     const liveConfig = buildTestConfig({ PMS_MODE: "live", PMS_CADENCE_N: "1" });
     const model = new FakeModelAdapter([new Error("simulated network failure")]);
     const outcome = await processHookEvent(makePostToolUsePayload({ session_id: "s1" }), {
@@ -242,7 +244,7 @@ Fix the regex so it only matches single-digit octets.
     const log = getInterventionLog(tmp, "s1", 1);
     assert.equal(log?.decision, "silence");
     const trig = getTriggerEvent(tmp, "s1", 1);
-    assert.match(trig?.error as string, /simulated network failure/);
+    assert.equal(trig?.error, "provider_error");
   });
 
   test("unparseable model output degrades to silence with phase2_outcome=parse_error", async () => {
@@ -382,6 +384,117 @@ Reminder: a completely different sentence about topic two entirely, unrelated wo
     const log = getInterventionLog(tmp, "s1", 1);
     assert.equal(typeof log?.latency_ms, "number");
     assert.ok((log?.latency_ms as number) >= 0);
+  });
+});
+
+describe("engine: provider-egress privacy boundary", () => {
+  let tmp: TempDb;
+
+  beforeEach(() => {
+    tmp = openTempDb();
+  });
+  afterEach(() => tmp.cleanup());
+
+  for (const [name, command] of [
+    ["denied external command", "TOKEN=do-not-store railway status"],
+    ["denied nested command", "echo $(curl -H 'Authorization: Bearer do-not-store' https://example.invalid)"],
+    ["ambiguous executable", "private-company-cli --secret do-not-store"],
+  ] as const) {
+    test(`${name} creates no prompt, makes zero adapter calls, and persists no raw command`, async () => {
+      const config = buildTestConfig({ PMS_CADENCE_N: "1", PMS_MODE: "shadow" });
+      const model = new FakeModelAdapter();
+      let promptBuilds = 0;
+      const promptBuilder = () => {
+        promptBuilds += 1;
+        return { system: "must not exist", user: "must not exist" };
+      };
+
+      const outcome = await processHookEvent(
+        makePostToolUsePayload({ session_id: `privacy-${name}`, tool_input: { command } }),
+        { db: tmp.db, modelAdapter: model, config, promptBuilder },
+      );
+
+      assert.equal(outcome.stdoutJson, null);
+      assert.equal(promptBuilds, 0, "provider-bound prompt construction must not run");
+      assert.equal(model.calls.length, 0, "the model adapter must not be called");
+
+      const persisted = tmp.db.prepare(
+        `SELECT input_sig, error FROM trigger_event WHERE session_id = ?`,
+      ).get(`privacy-${name}`) as { input_sig: string | null; error: string | null } | undefined;
+      assert.ok(persisted?.input_sig?.startsWith("sha256:"));
+      assert.equal(persisted?.error, null);
+      const persistedDatabase = [
+        "session",
+        "entry",
+        "intervention_log",
+        "trigger_event",
+        "bank_op_log",
+        "session_progress",
+        "effectiveness_metric",
+      ].flatMap((table) => tmp.db.prepare(`SELECT * FROM ${table}`).all());
+      assert.doesNotMatch(
+        JSON.stringify(persistedDatabase),
+        /do-not-store|railway|curl|private-company-cli|example\.invalid/,
+      );
+      const metric = tmp.db.prepare(
+        `SELECT skip_reason, provider_outcome, parser_outcome, guard_outcome, emitted_reminder
+           FROM effectiveness_metric WHERE session_id = ?`,
+      ).get(`privacy-${name}`) as Record<string, unknown> | undefined;
+      assert.equal(metric?.provider_outcome, "not_called");
+      assert.match(String(metric?.skip_reason), /^egress_/);
+      assert.equal(metric?.parser_outcome, "not_run");
+      assert.equal(metric?.guard_outcome, "not_run");
+      assert.equal(metric?.emitted_reminder, 0);
+    });
+  }
+});
+
+describe("engine: Codex recent-trajectory regression", () => {
+  let tmp: TempDb;
+  beforeEach(() => {
+    tmp = openTempDb();
+  });
+  afterEach(() => tmp.cleanup());
+
+  test("Codex response_item messages reach prompt construction before cadence is tuned", async () => {
+    const transcriptPath = join(tmp.dir, "codex-rollout.jsonl");
+    writeFileSync(transcriptPath, [
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "preserve fail-open execution" }] },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "checking the current implementation" }] },
+      }),
+    ].join("\n"));
+
+    const model = new FakeModelAdapter();
+    let observedTexts: string[] = [];
+    await processHookEvent(
+      makePostToolUsePayload({
+        session_id: "codex-trajectory",
+        harness: "codex",
+        transcript_path: transcriptPath,
+        tool_input: { command: "echo safe" },
+      }),
+      {
+        db: tmp.db,
+        modelAdapter: model,
+        config: buildTestConfig({ PMS_CADENCE_N: "1" }),
+        promptBuilder: (ctx) => {
+          observedTexts = ctx.transcriptTail.map((message) => message.text);
+          return { system: "system", user: "user" };
+        },
+      },
+    );
+    assert.deepEqual(observedTexts, ["preserve fail-open execution", "checking the current implementation"]);
+    assert.equal(model.calls.length, 1);
+    const metric = tmp.db.prepare(
+      `SELECT harness, provider_outcome, parser_outcome FROM effectiveness_metric
+        WHERE session_id = 'codex-trajectory' AND step = 1`,
+    ).get() as Record<string, unknown> | undefined;
+    assert.deepEqual({ ...metric }, { harness: "codex", provider_outcome: "success", parser_outcome: "accepted" });
   });
 });
 

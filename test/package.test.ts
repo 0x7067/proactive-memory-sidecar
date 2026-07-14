@@ -14,6 +14,17 @@ interface NpmPackReport {
   files: NpmPackFileEntry[];
 }
 
+function normalizePackReports(parsed: unknown): NpmPackReport[] {
+  if (Array.isArray(parsed)) return parsed as NpmPackReport[];
+  if (parsed && typeof parsed === "object") {
+    if ("files" in parsed) return [parsed as NpmPackReport];
+    return Object.values(parsed).filter(
+      (value): value is NpmPackReport => Boolean(value && typeof value === "object" && "files" in value),
+    );
+  }
+  return [];
+}
+
 /**
  * Package hygiene (Low-severity review fix #6): the npm package allowlist
  * (`package.json#files`) must not ship compiled test output or source
@@ -28,7 +39,7 @@ describe("package.json files allowlist (npm pack)", () => {
       cwd: REPO_ROOT,
       encoding: "utf8",
     });
-    const [report] = JSON.parse(stdout) as NpmPackReport[];
+    const [report] = normalizePackReports(JSON.parse(stdout));
     if (!report) throw new Error("npm pack --dry-run --json returned no report");
     const paths = report.files.map((f) => f.path);
 

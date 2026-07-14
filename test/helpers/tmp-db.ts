@@ -19,7 +19,7 @@ export function makeTempDir(): { dir: string; cleanup: () => void } {
 
 export function openTempDb(config: Pick<Config, "busyTimeoutMs"> = { busyTimeoutMs: 2000 }): TempDb {
   const { dir, cleanup } = makeTempDir();
-  const dbPath = join(dir, ".claude", "pms", "bank.sqlite3");
+  const dbPath = join(dir, ".proactive-memory", "bank.sqlite3");
   const db = openDatabase(dbPath, config);
   return {
     db,

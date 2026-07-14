@@ -128,6 +128,18 @@ if you touch code near it.
     `PostToolUse`, because the emitted `hookEventName` must stay valid for
     the originating harness. Keep this normalization mechanical and cover
     any new failure signal in parser, engine, and CLI-subprocess tests.
+13. **Provider egress is classified before prompt construction.**
+    `src/privacy/provider-egress.ts` is the mechanical boundary for direct
+    tools and shell-like commands. A denied or ambiguous event must emit
+    nothing, make zero model-adapter calls, and persist no raw tool input,
+    command, response, error, or secret. Prompts receive only the documented
+    `ProviderEventSummary`; repeat detection persists only `sha256:`
+    fingerprints. Keep the adversarial matrix in
+    `test/privacy/provider-egress.test.ts` current when the parser changes.
+14. **Storage defaults stay standalone and project-local.** The default is
+    `<payload cwd>/.proactive-memory/bank.sqlite3`; no installer or wrapper may
+    redirect it to a machine-global state directory. `openDatabase` must repair
+    directory mode to `700` and database mode to `600` on every open.
 
 ## Repo layout
 
@@ -141,7 +153,9 @@ src/
   store/          one module per table (+ the three auxiliary tables) — all DB
                   access outside src/db goes through these, never raw SQL
                   scattered around
-  transcript/     Claude Code transcript JSONL tail reader
+  transcript/     Claude Code and Codex rollout JSONL tail reader
+  privacy/        deterministic provider-egress classification + summaries
+  effectiveness/  per-harness rollout gate calculation
   trigger/        cadence/forced/near-duplicate/PreCompact trigger policy
   model/          ModelAdapter interface + default Anthropic/OpenAI-compatible impl
   engine/         prompt building, response parsing, mechanical guards, orchestration

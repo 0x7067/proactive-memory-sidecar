@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Config } from "../config.js";
@@ -26,15 +26,19 @@ import { initializeSchema } from "./schema.js";
  *    session(session_id)`, so we turn enforcement on to honor it.
  */
 export function openDatabase(dbPath: string, config: Pick<Config, "busyTimeoutMs">): DatabaseSync {
-  mkdirSync(dirname(dbPath), { recursive: true });
+  const dbDirectory = dirname(dbPath);
+  mkdirSync(dbDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(dbDirectory, 0o700);
 
   const db = new DatabaseSync(dbPath);
+  chmodSync(dbPath, 0o600);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec(`PRAGMA busy_timeout = ${config.busyTimeoutMs}`);
   db.exec("PRAGMA foreign_keys = ON");
 
   initializeSchema(db);
+  chmodSync(dbPath, 0o600);
 
   return db;
 }

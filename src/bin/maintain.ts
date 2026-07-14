@@ -48,7 +48,7 @@ Usage:
   pms-maintain [--cwd <path>] [--older-than-days 30] [--dry-run] [--vacuum]
 
 Options:
-  --cwd <path>            Project directory whose .claude/pms database to prune (default: cwd)
+  --cwd <path>            Project directory whose .proactive-memory database to prune (default: cwd)
   --older-than-days <n>   Delete sessions whose last activity is older than n days (default: 30)
   --dry-run               Report what would be deleted without deleting anything
   --vacuum                Run VACUUM after pruning to reclaim disk space
@@ -87,9 +87,11 @@ function main(): void {
     if (args.dryRun) return;
 
     const deleteBankOpLog = db.prepare(`DELETE FROM bank_op_log WHERE session_id = ?`);
+    const deleteEffectiveness = db.prepare(`DELETE FROM effectiveness_metric WHERE session_id = ?`);
     const deleteTrigger = db.prepare(`DELETE FROM trigger_event WHERE session_id = ?`);
     const deleteLog = db.prepare(`DELETE FROM intervention_log WHERE session_id = ?`);
     const deleteEntries = db.prepare(`DELETE FROM entry WHERE session_id = ?`);
+    const deleteProgress = db.prepare(`DELETE FROM session_progress WHERE session_id = ?`);
     const deleteSession = db.prepare(`DELETE FROM session WHERE session_id = ?`);
 
     db.exec("BEGIN IMMEDIATE");
@@ -99,9 +101,11 @@ function main(): void {
         // plain REFERENCES with no ON DELETE clause, and we run with
         // `PRAGMA foreign_keys = ON`, so the parent row must go last.
         deleteBankOpLog.run(s.session_id);
+        deleteEffectiveness.run(s.session_id);
         deleteTrigger.run(s.session_id);
         deleteLog.run(s.session_id);
         deleteEntries.run(s.session_id);
+        deleteProgress.run(s.session_id);
         deleteSession.run(s.session_id);
       }
       db.exec("COMMIT");

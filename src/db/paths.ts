@@ -4,7 +4,7 @@ import type { Config } from "../config.js";
 /**
  * Resolves the project-local SQLite file path for a hook event.
  *
- * Default: `<payloadCwd>/.claude/pms/bank.sqlite3` — one file per project,
+ * Default: `<payloadCwd>/.proactive-memory/bank.sqlite3` — one file per project,
  * holding every session's rows (isolated by `session_id`), never a global
  * or user-home path. `PMS_DB_PATH` overrides with an absolute path (or one
  * resolved against `payloadCwd` if relative) for operators who want the

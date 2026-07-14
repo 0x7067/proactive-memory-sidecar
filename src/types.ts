@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 
 export type HandledHookEventName = "PostToolUse" | "PostToolUseFailure" | "PreCompact";
+export type HarnessName = "claude" | "codex" | "unknown";
 
 // NB: optional hook fields are modeled as required-but-nullable
 // (`T | undefined`) rather than `?:` throughout this section. The project
@@ -28,6 +29,8 @@ export interface CommonHookFields {
   agent_type: string | undefined;
   permission_mode: string | undefined;
   prompt_id: string | undefined;
+  /** Mechanically inferred from harness-specific fields/paths; never model-generated. */
+  harness: HarnessName;
 }
 
 export interface PostToolUsePayload extends CommonHookFields {
@@ -120,6 +123,7 @@ export type Phase2Outcome =
   | "parse_error"
   /** A stale, out-of-order response for a step a newer step has already superseded — see src/store/session-progress-store.ts. */
   | "stale_superseded"
+  | `skipped:${string}`
   | `rejected:${string}`;
 
 export interface TriggerEventRow {
@@ -145,6 +149,26 @@ export interface BankOpLogRow {
   entry_id: string | null;
   applied: 0 | 1;
   reason: string | null;
+  created_at: number;
+}
+
+export interface EffectivenessMetricRow {
+  session_id: string;
+  step: number;
+  harness: HarnessName;
+  trigger_reason: TriggerReason;
+  skip_reason: string;
+  provider_outcome: string;
+  parser_outcome: string;
+  guard_outcome: string;
+  bank_operation: string;
+  bank_ops_total: number;
+  bank_ops_applied: number;
+  bank_ops_rejected: number;
+  emitted_reminder: 0 | 1;
+  latency_ms: number;
+  tokens_in: number | null;
+  tokens_out: number | null;
   created_at: number;
 }
 

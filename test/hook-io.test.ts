@@ -62,6 +62,28 @@ describe("parseHookPayload", () => {
     }
   });
 
+  test("infers Codex and Claude harnesses from their actual wire fields", () => {
+    const codex = parseHookPayload({
+      session_id: "s1",
+      turn_id: "turn-1",
+      cwd: "/proj",
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "echo hi" },
+      tool_response: { exit_code: 0 },
+    });
+    const claude = parseHookPayload({
+      session_id: "s2",
+      cwd: "/proj",
+      hook_event_name: "PostToolUseFailure",
+      tool_name: "Bash",
+      tool_input: { command: "false" },
+      error: "failed",
+    });
+    assert.equal(codex?.harness, "codex");
+    assert.equal(claude?.harness, "claude");
+  });
+
   test("PostToolUse without tool_name is rejected", () => {
     assert.equal(
       parseHookPayload({ session_id: "s1", cwd: "/proj", hook_event_name: "PostToolUse" }),

@@ -86,10 +86,10 @@ export const DEFAULT_STATUS_MAX_CHARS = 300;
 export const DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 900;
 
 /** Relative path (joined onto the hook payload's `cwd`) of the project-local SQLite file. */
-export const DEFAULT_DB_RELATIVE_PATH = ".claude/pms/bank.sqlite3";
+export const DEFAULT_DB_RELATIVE_PATH = ".proactive-memory/bank.sqlite3";
 
 /** Current SQLite schema version, tracked via `PRAGMA user_version`. */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** The three hook events this sidecar attaches to. Anything else is a silent no-op. */
 export const HANDLED_HOOK_EVENTS = [
